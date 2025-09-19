@@ -1,58 +1,69 @@
 # vex ⚡  
-*A minimal load testing tool for HTTP servers*  
 
-`vex` is a lightweight, high-performance load tester (inspired by `wrk` and `hey`) designed to simulate **concurrent users** and measure **throughput, latency, and error rates**.  
+A minimal load testing tool for HTTP/3 servers built in Rust
 
 ---
 
-## 🚀 Vision  
+## ✨ Vision
 
-- Stress test APIs and web services with **thousands of concurrent requests**.  
-- Collect rich **latency metrics** (avg, p50, p95, p99, max).  
-- Provide a simple **CLI interface** with flexible parameters.  
-- Future-proof: modular enough to extend for **TCP/WebSocket** testing.  
+- **HTTP/3 support** with `reqwest` and `rustls-tls`
+- **Concurrent request execution** using Tokio async runtime
+- **Basic metrics collection**: success/failure counts and RPS calculation
+- **Self-signed certificate support** for local testing
+- **Simple console output** with request statistics
 
 ---
 
 ## 🧩 Planned Features  
 
-- [ ] Run with **concurrency (`-c`)** and **duration (`-d`)** or **requests (`-n`)**.  
-- [ ] Measure **RPS (requests/sec)** and **latency stats**.  
-- [ ] Export results as **JSON/CSV**.  
-- [ ] Support **custom headers** & **POST payloads**.  
-- [ ] Connection **keep-alive** vs fresh-per-request.  
-- [ ] Simple **histogram reporting** in console.  
-- [ ] (Later) Ramp-up traffic mode (gradual increase).  
-- [ ] (Later) Support for **distributed load testing** across multiple nodes.  
+- [ ] **CLI interface** with configurable parameters (`-c`, `-d`, `-n`)
+- [ ] **Rich latency metrics** (avg, p50, p95, p99, max)
+- [ ] **Export results** as JSON/CSV
+- [ ] **Custom headers** & **POST payloads** support
+- [ ] **Connection keep-alive** vs fresh-per-request options
+- [ ] **Histogram reporting** in console
+- [ ] **Ramp-up traffic mode** (gradual increase)
+- [ ] **Distributed load testing** across multiple nodes
 
 ---
 
-## ⚙️ Workflow (Implementation Plan)  
+## 🏗️ Current Implementation  
 
-1. **Input & Config Parser**  
-   - Parse CLI args (url, concurrency, requests, duration, headers, body).  
+The current implementation demonstrates the core architecture:
 
-2. **Worker Engine**  
-   - Spawn workers (goroutines or async tasks).  
-   - Each worker sends requests until done.  
-   - Record latency + status.  
+1. **HTTP/3 Client Setup**  
+   - Uses `reqwest` with `http3_prior_knowledge()` for HTTP/3 support
+   - Configured to accept self-signed certificates for local testing
 
-3. **Aggregator**  
-   - Collect results from workers.  
-   - Calculate throughput, latency distribution, errors.  
+2. **Concurrent Worker System**  
+   - Spawns multiple async tasks using `tokio::spawn`
+   - Each worker handles a portion of the total requests
+   - Uses atomic counters for thread-safe metrics collection
 
-4. **Reporter**  
-   - Console output (human-readable).  
-   - Optional JSON/CSV export.  
+3. **Basic Metrics Collection**  
+   - Tracks successful and failed requests
+   - Calculates requests per second (RPS)
+   - Measures total elapsed time
 
-5. **Optimizations (Phase 2)**  
-   - Connection reuse.  
-   - Efficient timers.  
-   - Lock-free channels (Rust) / minimal contention (Go).  
+4. **Simple Reporting**  
+   - Console output with basic statistics
+   - Success/failure counts and performance metrics
 
 ---
 
-## 📊 Example Usage (planned)  
+## 📊 Current Usage  
+
+```bash
+# Compile and run (currently hardcoded parameters)
+cargo run
+
+# Current configuration in main.rs:
+# - URL: https://127.0.0.1:7777
+# - Total requests: 1000
+# - Concurrency: 50 workers
+```
+
+## 📊 Planned CLI Usage  
 
 ```bash
 # Run 5000 requests with 100 concurrent workers
@@ -70,18 +81,28 @@ vex -c 50 -n 1000 -X POST -H "Content-Type: application/json" \
 
 ## 📅 Roadmap
 
-* **Month 1** → MVP with basic concurrency + stats.
-* **Month 2** → Latency percentiles, exports, keep-alive, error handling.
-* **Future** → TCP/WebSocket support, distributed mode.
+* **Phase 1** ✅ → Basic HTTP/3 load testing with concurrent workers
+* **Phase 2** → CLI interface, latency percentiles, and export features
+* **Phase 3** → Advanced features (keep-alive, custom headers, POST support)
+* **Future** → TCP/WebSocket support, distributed mode
 
 ---
 
-## 📝 Notes to Future Me
+## 🛠️ Dependencies
 
-* Keep it **minimal like `wrk`**, not bloated.
-* Decide early: **Go = simple goroutines**, **Rust = perf + fine-grained control**.
-* Benchmark against `wrk` to see where we stand.
-* Don’t over-optimize before MVP — focus on reliability first.
+- **Tokio** - Async runtime for concurrent request handling
+- **Reqwest** - HTTP client with HTTP/3 support via rustls
+- **Futures** - Async utilities for joining concurrent tasks
+
+---
+
+## 📝 Development Notes
+
+* **Rust chosen** for performance and fine-grained control over concurrency
+* **HTTP/3 focus** - modern protocol with better performance characteristics
+* **Atomic operations** used for thread-safe metrics collection
+* **Async/await pattern** for efficient concurrent request handling
+* Keep it **minimal like `wrk`** - focus on core functionality first
 
 ---
 
