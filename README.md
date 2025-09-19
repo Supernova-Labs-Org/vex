@@ -108,4 +108,4 @@ vex -c 50 -n 1000 -X POST -H "Content-Type: application/json" \
 
 ## 🔖 License
 
-MIT (can switch later if needed).
+Apache 2.0
