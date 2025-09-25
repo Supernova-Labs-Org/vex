@@ -11,12 +11,17 @@ use futures::future::join_all;
 use reqwest::Client;
 
 
+// need to replace reqwest client to the h3 client
+pub mod client;
+
+
 
 #[tokio::main]
 async fn main(){
-    let server_url = "https://127.0.0.1:7777";
-    let total_request_send = 1000;
-    let concurrency = 50;
+
+    let server_url = "http://127.0.0.1:7777";
+    let total_request_send = 5;
+    let concurrency = 2;
 
     let request_client = Client::builder()
         .http3_prior_knowledge()
