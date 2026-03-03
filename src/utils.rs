@@ -25,9 +25,9 @@ fn parse_target(target: &str, default_port: u16) -> Result<(String, u16), Box<dy
             let host = &stripped[..bracket_end + 1]; // Include the brackets
             let remaining = &stripped[bracket_end + 1..];
 
-            let port = if remaining.starts_with(':') {
+            let port = if let Some(port_str) = remaining.strip_prefix(':') {
                 // Embedded port found
-                remaining[1..]
+                port_str
                     .parse::<u16>()
                     .map_err(|_| format!("Invalid port in target: {}", target))?
             } else if remaining.is_empty() {

@@ -82,11 +82,11 @@ impl Http3Client {
         let mut errors = ErrorStats::default();
 
         // Initial packet send
-        if let Ok((write, send_info)) = conn.send(&mut out) {
-            if let Err(e) = socket.send_to(&out[..write], send_info.to).await {
-                eprintln!("Initial send_to failed: {}", e);
-                errors.send_errors += 1;
-            }
+        if let Ok((write, send_info)) = conn.send(&mut out)
+            && let Err(e) = socket.send_to(&out[..write], send_info.to).await
+        {
+            eprintln!("Initial send_to failed: {}", e);
+            errors.send_errors += 1;
         }
 
         while !response_done && !conn.is_closed() {
@@ -155,10 +155,8 @@ impl Http3Client {
                                 let value = String::from_utf8_lossy(h.value());
 
                                 // Parse :status header
-                                if name == ":status" {
-                                    if let Ok(code) = value.parse::<u16>() {
-                                        status_code = code;
-                                    }
+                                if name == ":status" && let Ok(code) = value.parse::<u16>() {
+                                    status_code = code;
                                 }
 
                                 // Only print headers in verbose mode
