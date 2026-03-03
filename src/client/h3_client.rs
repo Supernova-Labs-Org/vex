@@ -1,10 +1,10 @@
 use quiche::{self, h3::Header};
 use rand::RngCore;
 use std::{
-    net::{UdpSocket, SocketAddr},
+    net::SocketAddr,
     time::{Duration, Instant},
 };
-use quiche::h3::NameValue;
+use tokio::net::UdpSocket;
 use crate::utils::resolve_target;
 
 pub struct Http3Client {
@@ -43,8 +43,7 @@ impl Http3Client {
 
         // Bind local UDP socket
         let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_nonblocking(true)?;
+        let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
 
         // QUIC connection ID
@@ -62,11 +61,10 @@ impl Http3Client {
         let mut out = [0u8; 65_535];
         let mut buf = [0u8; 65_535];
         let start = Instant::now();
-        let mut last_timeout = Instant::now();
 
         // Initial packet send
         if let Ok((write, send_info)) = conn.send(&mut out) {
-            let _ = socket.send_to(&out[..write], send_info.to);
+            let _ = socket.send_to(&out[..write], send_info.to).await;
         }
 
         while !response_done && !conn.is_closed() {
@@ -74,34 +72,27 @@ impl Http3Client {
             loop {
                 match conn.send(&mut out) {
                     Ok((write, send_info)) => {
-                        let _ = socket.send_to(&out[..write], send_info.to);
+                        let _ = socket.send_to(&out[..write], send_info.to).await;
                     }
                     Err(quiche::Error::Done) => break,
                     Err(e) => return Err(format!("send failed: {:?}", e).into()),
                 }
             }
 
-            // Set read timeout
+            // Get quiche timeout and wait for packet or timeout
             let timeout = conn.timeout().unwrap_or(Duration::from_millis(50));
-            socket.set_read_timeout(Some(timeout))?;
 
-            // Receive packets
-            match socket.recv_from(&mut buf) {
-                Ok((len, from)) => {
+            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, from))) => {
+                    // Packet received, process it
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
                     let _ = conn.recv(&mut buf[..len], recv_info);
                 }
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    let now = Instant::now();
-                    if now >= last_timeout + timeout {
-                        conn.on_timeout();
-                        last_timeout = now;
-                    }
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    // Timeout expired, notify quiche
+                    conn.on_timeout();
                 }
-                Err(e) => return Err(e.into()),
             }
 
             // Initialize H3 once QUIC established
