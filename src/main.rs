@@ -9,20 +9,28 @@ pub mod utils;
 struct Cli {
     #[arg(long, default_value = "h3")]
     protocol: String,
+
     #[arg(long)]
     target: String,
+
     #[arg(long, default_value = "443")]
     port: u16,
+
     #[arg(short = 'n', long, default_value = "1000")]
     requests: usize,
-    #[arg(short = 'w', long, default_value = "1")]
+
+    #[arg(short = 'w', long, default_value = "1", value_parser = clap::value_parser!(usize).range(1..))]
     workers: usize,
+    
     #[arg(short = 't', long, default_value = "30")]
     duration: u64,
+    
     #[arg(long, default_value = "/")]
     path: String,
+    
     #[arg(long)]
     host: Option<String>,
+    
     #[arg(long)]
     insecure: bool,
 }
@@ -55,13 +63,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut handles = vec![];
 
+    // Distribute requests: quotient to all workers, remainder to first N workers
+    let quotient = cli.requests / cli.workers;
+    let remainder = cli.requests % cli.workers;
+
     for worker_id in 0..cli.workers {
         let target = cli.target.clone();
         let port = cli.port;
         let host = host.clone();
         let path = cli.path.clone();
         let insecure = cli.insecure;
-        let requests_per_worker = cli.requests / cli.workers;
+        let requests_per_worker = quotient + if worker_id < remainder { 1 } else { 0 };
         let _duration = cli.duration;
 
         let handle = tokio::spawn(async move {
@@ -112,6 +124,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Successful requests: {}", successful_requests);
     println!("  Failed requests: {}", failed_requests);
     println!("  Requests/sec: {:.2}", if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 });
+
+    // Verify that all requested requests were sent
+    if total_requests != cli.requests {
+        eprintln!(
+            "Warning: Request count mismatch! Expected {}, but sent {}",
+            cli.requests, total_requests
+        );
+        return Err(format!(
+            "Request count mismatch: expected {} but sent {}",
+            cli.requests, total_requests
+        )
+        .into());
+    }
 
     Ok(())
 }
