@@ -16,16 +16,14 @@ A minimal load testing tool for HTTP/3 servers built in Rust.
 
 ## Features
 
-- [x] CLI interface with configurable parameters
-- [x] Rich latency metrics (avg, p50, p90, p95, p99, min, max)
-- [x] Error tracking and classification (send errors, recv errors, QUIC errors, stream resets)
-- [x] HTTP status code validation and breakdown
-- [x] Verbose mode for debugging
-- [ ] Export results as JSON/CSV
-- [ ] Custom headers and POST payload support
-- [ ] Connection keep-alive vs fresh-per-request options
-- [ ] Ramp-up traffic mode (gradual increase)
-- [ ] Distributed load testing across multiple nodes
+- CLI interface with configurable parameters
+- Rich latency metrics (avg, p50, p90, p95, p99, min, max)
+- Error tracking and classification (send errors, recv errors, QUIC errors, stream resets)
+- HTTP status code validation and breakdown
+- Verbose mode for debugging
+- Concurrent worker system with request distribution
+- Duration-based and request-count-based load testing
+- Self-signed certificate support
 
 ---
 

@@ -28,3 +28,8 @@ target
 
 # SSL certificates
 certs/
+
+
+# mkdocs 
+.venv/
+site/

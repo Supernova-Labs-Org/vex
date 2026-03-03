@@ -1,0 +1,114 @@
+site_name: vex
+site_description: HTTP/3 load testing tool for high-performance testing
+site_author: Nishant
+site_url: https://nishujangra.github.io/vex/
+repo_url: https://github.com/nishujangra/vex/
+repo_name: vex
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+exclude_docs: |
+  internal/
+
+theme:
+  name: shadcn
+  custom_dir: overrides
+  show_title: true
+  palette:
+    - scheme: slate
+      primary: blue
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Dark mode
+    - scheme: default
+      primary: blue
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Light mode
+  features:
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.tracking
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - toc.follow
+    - content.code.copy
+    - content.code.select
+    - content.code.annotate
+    - search.suggest
+    - search.highlight
+    - search.share
+
+nav:
+  - Home: INDEX.md
+  - Getting Started:
+      - Installation: GETTING_STARTED.md
+      - CLI Reference: CLI_REFERENCE.md
+  - Usage:
+      - Examples: EXAMPLES.md
+      - Metrics & Output: METRICS.md
+  - Benchmarking:
+      - Spooky Proxy: ../spooky.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - fenced_code
+  - footnotes
+  - md_in_html
+  - tables
+  - pymdownx.highlight:
+      use_pygments: true
+      pygments_style: material
+      linenums: false
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_div_format
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:pymdownx.emoji.twemoji
+      emoji_generator: !!python/name:pymdownx.emoji.to_svg
+  - pymdownx.arithmatex:
+      generic: true
+  - toc:
+      permalink: true
+      title: On this page
+      toc_depth: 2-4
+
+plugins:
+  - search:
+      lang: en
+      separator: '[\s\-,:!=\[\]()"`/]+'
+
+extra:
+  version:
+    provider: mike
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/nishujangra
+    - icon: fontawesome/brands/rust
+      link: https://www.rust-lang.org/
+  analytics:
+    provider: google
+    property: G_MEASUREMENT_ID
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/extra.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
