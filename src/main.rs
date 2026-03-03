@@ -1,5 +1,6 @@
 use clap::Parser;
-use std::time::{Instant};
+use std::sync::Arc;
+use std::time::{Instant, Duration};
 
 pub mod client;
 pub mod utils;
@@ -57,6 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let start_time = Instant::now();
+    let deadline = start_time + Duration::from_secs(cli.duration);
+    let deadline = Arc::new(deadline);
     let mut total_requests = 0;
     let mut successful_requests = 0;
     let mut failed_requests = 0;
@@ -74,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = cli.path.clone();
         let insecure = cli.insecure;
         let requests_per_worker = quotient + if worker_id < remainder { 1 } else { 0 };
-        let _duration = cli.duration;
+        let deadline = Arc::clone(&deadline);
 
         let handle = tokio::spawn(async move {
             let mut client = match client::h3_client::Http3Client::new(insecure) {
@@ -87,12 +90,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut success = 0;
             let mut fail = 0;
-            let _start = Instant::now();
 
             for i in 0..requests_per_worker {
-                // if start.elapsed() >= Duration::from_secs(duration) {
-                //     break;
-                // }
+                // Check if we've exceeded the duration deadline
+                if Instant::now() >= *deadline {
+                    break;
+                }
+
                 match client.send_request(&target, port, &host, &path).await {
                     Ok(_) => success += 1,
                     Err(e) => {
@@ -117,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
+    let hit_duration_limit = Instant::now() >= *deadline;
 
     println!("\nLoad test completed:");
     println!("  Total time: {:.2}s", elapsed);
@@ -125,8 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Failed requests: {}", failed_requests);
     println!("  Requests/sec: {:.2}", if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 });
 
-    // Verify that all requested requests were sent
-    if total_requests != cli.requests {
+    if hit_duration_limit {
+        println!("  Completion reason: Duration limit ({:.0}s) reached", cli.duration);
+    } else {
+        println!("  Completion reason: All {} requests completed", cli.requests);
+    }
+
+    // Verify that all requested requests were sent (only if we didn't hit duration limit)
+    if !hit_duration_limit && total_requests != cli.requests {
         eprintln!(
             "Warning: Request count mismatch! Expected {}, but sent {}",
             cli.requests, total_requests
