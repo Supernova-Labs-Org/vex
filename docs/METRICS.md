@@ -21,8 +21,13 @@ Successful requests: 995
 Failed requests: 5
 ```
 
-- Success: HTTP requests with 2xx status codes (200-299)
-- Failure: Any other outcome (3xx, 4xx, 5xx, network errors, timeouts)
+- **Success**: HTTP requests matching the `--success-status` criteria (default: 2xx only)
+- **Failure**: Any other outcome (non-matching status codes, network errors, timeouts)
+
+By default, only HTTP 2xx status codes (200-299) are counted as successful. You can customize this with `--success-status`:
+- `--success-status 2xx` (default): Only 2xx status codes
+- `--success-status 2xx,3xx`: Both 2xx and 3xx status codes
+- `--success-status 200,201,301`: Specific status codes
 
 ### Completion Reason
 

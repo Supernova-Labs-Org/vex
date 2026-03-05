@@ -7,27 +7,7 @@ pub mod client;
 pub mod utils;
 
 use client::h3_client::ErrorStats;
-
-/// Helper function to compute percentile from sorted values
-fn percentile(sorted_values: &[f64], p: f64) -> f64 {
-    if sorted_values.is_empty() {
-        return 0.0;
-    }
-    if sorted_values.len() == 1 {
-        return sorted_values[0];
-    }
-
-    let idx = (p / 100.0) * (sorted_values.len() - 1) as f64;
-    let lower = idx.floor() as usize;
-    let upper = idx.ceil() as usize;
-    let weight = idx - idx.floor();
-
-    if lower == upper {
-        sorted_values[lower]
-    } else {
-        sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
-    }
-}
+use utils::{percentile, is_success_status};
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -61,6 +41,9 @@ struct Cli {
 
     #[arg(long, default_value = "false")]
     verbose: bool,
+
+    #[arg(long, default_value = "2xx", help = "HTTP status codes to consider as success (e.g., '2xx', '2xx,3xx', or specific codes '200,201,301')")]
+    success_status: String,
 }
 
 #[tokio::main]
@@ -116,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let path = cli.path.clone();
         let insecure = cli.insecure;
         let verbose = cli.verbose;
+        let success_status = cli.success_status.clone();
         let requests_per_worker = quotient + if worker_id < remainder { 1 } else { 0 };
         let deadline = Arc::clone(&deadline);
 
@@ -145,8 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Track status code
                         *status_codes.entry(result.status_code).or_insert(0) += 1;
 
-                        // Classify as success/fail based on status code (2xx is success/ redirect are not failure)
-                        if (result.status_code >= 200 && result.status_code < 300) || (result.status_code == 301 || result.status_code == 302)  {
+                        // Classify as success/fail based on success_status pattern
+                        if is_success_status(result.status_code, &success_status) {
                             success += 1;
                         } else {
                             fail += 1;

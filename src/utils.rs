@@ -82,6 +82,75 @@ pub fn resolve_target(target: &str, port: u16) -> Result<SocketAddr, Box<dyn std
         .ok_or_else(|| format!("Could not resolve host: {}", target).into())
 }
 
+/// Compute percentile from sorted values using linear interpolation
+///
+/// # Arguments
+/// * `sorted_values` - Values sorted in ascending order
+/// * `p` - Percentile value (0-100)
+///
+/// # Examples
+/// * `percentile(&[1.0, 2.0, 3.0], 50.0)` → 2.0 (median)
+/// * `percentile(&[1.0, 2.0, 3.0, 4.0, 5.0], 95.0)` → 4.8
+pub fn percentile(sorted_values: &[f64], p: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    if sorted_values.len() == 1 {
+        return sorted_values[0];
+    }
+
+    let idx = (p / 100.0) * (sorted_values.len() - 1) as f64;
+    let lower = idx.floor() as usize;
+    let upper = idx.ceil() as usize;
+    let weight = idx - idx.floor();
+
+    if lower == upper {
+        sorted_values[lower]
+    } else {
+        sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+    }
+}
+
+/// Parse success status pattern and check if a status code is considered success
+///
+/// # Arguments
+/// * `status_code` - HTTP status code (e.g., 200, 301, 404)
+/// * `success_pattern` - Pattern string (e.g., "2xx", "2xx,3xx", "200,201,301")
+///
+/// # Supported patterns
+/// - Class patterns: `2xx`, `3xx`, `4xx`, `5xx`
+/// - Specific codes: comma-separated list (e.g., `200,201,301`)
+/// - Mixed: `2xx,3xx,500`
+///
+/// # Examples
+/// * `is_success_status(200, "2xx")` → true
+/// * `is_success_status(301, "2xx")` → false
+/// * `is_success_status(301, "2xx,3xx")` → true
+/// * `is_success_status(301, "200,201,301")` → true
+pub fn is_success_status(status_code: u16, success_pattern: &str) -> bool {
+    for part in success_pattern.split(',') {
+        let part = part.trim();
+        if part == "2xx" && status_code >= 200 && status_code < 300 {
+            return true;
+        }
+        if part == "3xx" && status_code >= 300 && status_code < 400 {
+            return true;
+        }
+        if part == "4xx" && status_code >= 400 && status_code < 500 {
+            return true;
+        }
+        if part == "5xx" && status_code >= 500 && status_code < 600 {
+            return true;
+        }
+        if let Ok(code) = part.parse::<u16>() {
+            if status_code == code {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
