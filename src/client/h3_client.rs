@@ -18,9 +18,11 @@ pub struct ErrorStats {
 #[derive(Debug, Clone)]
 pub struct ResponseResult {
     pub status_code: u16,
-    pub body: String,
+    pub bytes_received: usize,
     pub errors: ErrorStats,
     pub latency_ms: f64,
+    /// Body content only captured in verbose mode for debugging
+    pub body: Option<String>,
 }
 
 pub struct Http3Client {
@@ -73,6 +75,7 @@ impl Http3Client {
         let mut h3_conn: Option<quiche::h3::Connection> = None;
         let mut req_sent = false;
         let mut response_done = false;
+        let mut bytes_received: usize = 0;
         let mut response_body = Vec::new();
         let mut status_code = 0u16;
 
@@ -168,7 +171,12 @@ impl Http3Client {
                         Ok((stream_id, quiche::h3::Event::Data)) => {
                             loop {
                                 match h3.recv_body(&mut conn, stream_id, &mut buf) {
-                                    Ok(read) => response_body.extend_from_slice(&buf[..read]),
+                                    Ok(read) => {
+                                        bytes_received += read;
+                                        if verbose {
+                                            response_body.extend_from_slice(&buf[..read]);
+                                        }
+                                    }
                                     Err(quiche::h3::Error::Done) => break,
                                     Err(e) => {
                                         eprintln!("recv_body error: {:?}", e);
@@ -208,11 +216,17 @@ impl Http3Client {
         }
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let body = if verbose {
+            Some(String::from_utf8_lossy(&response_body).to_string())
+        } else {
+            None
+        };
         Ok(ResponseResult {
             status_code,
-            body: String::from_utf8_lossy(&response_body).to_string(),
+            bytes_received,
             errors,
             latency_ms,
+            body,
         })
     }
 }
