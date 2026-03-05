@@ -122,12 +122,35 @@ vex --target localhost --port 8443 --insecure
 
 ## Output Configuration
 
+### `--success-status <PATTERN>`
+
+Define which HTTP status codes count as successful requests.
+
+- Default: `2xx` (HTTP 200-299 only)
+- Pattern syntax supports class (2xx, 3xx, 4xx, 5xx) or specific codes (comma-separated)
+
+Examples:
+
+```bash
+# Default: only 2xx counts as success
+vex --target example.com
+
+# Count both 2xx and 3xx as success
+vex --target example.com --success-status 2xx,3xx
+
+# Count specific status codes as success
+vex --target example.com --success-status 200,201,204,301,302
+```
+
+This affects the "Successful/Failed requests" counts in the output.
+
 ### `--verbose`
 
 Enable verbose output.
 
 - Default: Disabled
 - Prints response headers for each request (may reduce throughput)
+- Only captures response body when verbose is enabled
 - Useful for debugging
 
 ```bash
