@@ -13,7 +13,6 @@ exclude_docs: |
 
 theme:
   name: shadcn
-  custom_dir: overrides
   show_title: true
   palette:
     - scheme: slate
@@ -51,8 +50,6 @@ nav:
   - Usage:
       - Examples: EXAMPLES.md
       - Metrics & Output: METRICS.md
-  - Benchmarking:
-      - Spooky Proxy: ../spooky.md
 
 markdown_extensions:
   - admonition
