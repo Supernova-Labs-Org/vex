@@ -14,6 +14,7 @@ exclude_docs: |
 theme:
   name: shadcn
   show_title: true
+  katex_options: {}
   palette:
     - scheme: slate
       primary: blue
