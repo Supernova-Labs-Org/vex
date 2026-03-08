@@ -12,7 +12,7 @@ cargo run --release -- --target 127.0.0.1 --port 9889 --insecure --workers 1 --r
 
 **Single upstream (root path):**
 ```bash
-cargo run --release -- --target 127.0.0.1 --port 9889 --insecure --path / --workers 100 --requests 1000
+cargo run --release -- --target 127.0.0.1 --port 9889 --insecure --path /api/v1 --workers 100 --requests 1000
 ```
 
 **Dual upstream (API path):**

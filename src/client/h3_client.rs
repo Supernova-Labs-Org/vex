@@ -46,9 +46,8 @@ impl Http3Client {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let pool = &mut self.pool;
 
-        // Always create fresh connection
-        // TODO: Fix HTTP/3 stream reuse - current impl has issues with stream ID tracking
-        // Disabling connection reuse for stability; each request gets a fresh connection
+        // Fresh connection per request (connection reuse has stream ID issues)
+        // Increased handshake timeout to handle concurrent TLS negotiations
 
         // Resolve target
         let peer_addr = resolve_target(target, port)?;
@@ -91,6 +90,9 @@ impl Http3Client {
             if quic_conn.is_established() && h3_conn.is_some() {
                 break;
             }
+
+            // Give other tasks a chance to run
+            tokio::task::yield_now().await;
 
             // Send pending packets
             loop {
@@ -162,7 +164,6 @@ impl Http3Client {
         let mut out = [0u8; 65_535];
         let mut buf = [0u8; 65_535];
         let mut stream_id: Option<u64> = None;
-        let mut request_sent = false;
 
         // Send request on new stream
         {
@@ -178,7 +179,6 @@ impl Http3Client {
                 Header::new(b"user-agent", b"vex-h3-client"),
             ];
             h3_conn.send_request(quic_conn, &req, true)?;
-            request_sent = true;
         }
 
         // Flush QUIC packets and handle response with minimal locking
@@ -187,7 +187,7 @@ impl Http3Client {
         let mut bytes_received = 0;
         let mut response_body = Vec::new();
 
-        while !response_done && start.elapsed() < Duration::from_secs(10) {
+        while !response_done && start.elapsed() < Duration::from_secs(5) {
             // Get socket and local_addr outside the critical section
             let (socket, local_addr) = {
                 let pool = &self.pool;
@@ -199,11 +199,7 @@ impl Http3Client {
                 let pool = &mut self.pool;
                 let quic_conn = pool.quic_conn.as_mut().ok_or("Connection lost")?;
 
-                let timeout = if request_sent {
-                    quic_conn.timeout().unwrap_or(Duration::from_millis(100))
-                } else {
-                    Duration::from_millis(50)
-                };
+                let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(100));
 
                 match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                     Ok(Ok((len, from))) => {
@@ -323,7 +319,7 @@ impl Http3Client {
             }
         }
 
-        if start.elapsed() >= Duration::from_secs(10) && !response_done {
+        if start.elapsed() >= Duration::from_secs(5) && !response_done {
             let pool = &mut self.pool;
             pool.failed = true;
             return Err("timeout waiting for response".into());
