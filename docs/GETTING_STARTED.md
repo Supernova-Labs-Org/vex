@@ -44,14 +44,6 @@ Runs for 60 seconds with 50 concurrent workers. The test stops when the duration
 cargo run --release -- --target api.example.com --path "/v1/users" --workers 100 --requests 10000
 ```
 
-### Custom Host Header
-
-Use this when the server listens on an IP but requires a specific Host header:
-
-```bash
-cargo run --release -- --target 10.0.0.5 --host api.example.com --port 8443 --insecure
-```
-
 ## Understanding Output
 
 After the test completes, you'll see:

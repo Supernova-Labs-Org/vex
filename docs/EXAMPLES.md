@@ -65,9 +65,6 @@ vex --target 127.0.0.1 --port 8443 --insecure --workers 50
 
 # IPv6 localhost
 vex --target "[::1]" --port 8443 --insecure
-
-# With host header for routing
-vex --target 127.0.0.1:8443 --host myservice.local --insecure
 ```
 
 ## Debugging
@@ -139,18 +136,6 @@ Monitor:
 - Requests/sec value
 - p99 latency for tail performance
 - Error counts for stability
-
-## Custom Host Header
-
-Test server behind a load balancer or reverse proxy:
-
-```bash
-# Target the load balancer IP but use public hostname
-vex --target 10.0.0.100 \
-    --host api.example.com \
-    --port 443 \
-    --workers 50
-```
 
 ## Diagnostic Run
 

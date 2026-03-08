@@ -75,11 +75,11 @@ cargo run --release -- --target example.com --workers 100 --requests 5000
 # Run for 60 seconds with 200 workers
 cargo run --release -- --target example.com --workers 200 --duration 60 --insecure
 
-# Test specific endpoint with custom host header
-cargo run --release -- --target service.local --port 8443 --workers 50 --requests 1000 --path "/api/health" --host "service.local" --insecure
+# Test specific endpoint
+cargo run --release -- --target service.local --port 8443 --workers 50 --requests 1000 --path "/api/health" --insecure
 
 # Full example with all options
-cargo run --release -- --protocol h3 --target example.com --port 443 --workers 100 --requests 10000 --duration 120 --path "/api/v1/test" --host "api.example.com"
+cargo run --release -- --target example.com --port 443 --workers 100 --requests 10000 --duration 120 --path "/api/v1/test"
 
 # Verbose output (prints response headers)
 cargo run --release -- --target example.com --workers 10 --requests 100 --verbose
@@ -87,16 +87,15 @@ cargo run --release -- --target example.com --workers 10 --requests 100 --verbos
 
 ### CLI Options
 
-- `--protocol h3` - Protocol (currently only HTTP/3 supported, default: h3)
 - `--target TARGET` - Target host or IP address (required)
 - `--port PORT` - Target port (default: 443)
 - `--workers N` - Number of concurrent workers (default: 1, minimum: 1)
 - `--requests N` - Total number of requests to send (default: 1000)
 - `--duration SECS` - Maximum duration in seconds (default: 30)
 - `--path PATH` - Request path (default: /)
-- `--host HOST` - Host header value (defaults to target if not specified)
 - `--insecure` - Disable TLS certificate verification
 - `--verbose` - Print response headers for each request
+- `--success-status PATTERN` - Success criteria (default: 2xx)
 
 ---
 

@@ -76,17 +76,6 @@ vex --target example.com --port 8443
 vex --target example.com:9000 --port 443  # Uses port 9000
 ```
 
-### `--host <HOST>`
-
-Host header value for the HTTP request.
-
-- Default: Same as `--target` value
-- Use when target is an IP but server expects a specific Host header
-
-```bash
-vex --target 10.0.0.5 --host api.example.com
-```
-
 ### `--path <PATH>`
 
 Request path for each HTTP request.
@@ -96,17 +85,6 @@ Request path for each HTTP request.
 
 ```bash
 vex --target example.com --path /api/v1/test
-```
-
-### `--protocol <PROTOCOL>`
-
-HTTP protocol to use.
-
-- Default: h3
-- Currently only h3 (HTTP/3) is supported
-
-```bash
-vex --target example.com --protocol h3
 ```
 
 ### `--insecure`
@@ -162,14 +140,12 @@ vex --target example.com --verbose
 All options combined:
 
 ```bash
-vex --protocol h3 \
-    --target api.example.com \
+vex --target api.example.com \
     --port 8443 \
     --workers 50 \
     --requests 5000 \
     --duration 120 \
     --path /api/v2/test \
-    --host api.example.com \
     --insecure \
     --verbose
 ```
