@@ -7,51 +7,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use crate::utils::resolve_target;
-
-#[derive(Debug, Clone, Default)]
-pub struct ErrorStats {
-    pub send_errors: usize,
-    pub recv_errors: usize,
-    pub quic_errors: usize,
-    pub stream_reset_errors: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResponseResult {
-    pub status_code: u16,
-    pub bytes_received: usize,
-    pub errors: ErrorStats,
-    pub latency_ms: f64,
-    /// Body content only captured in verbose mode for debugging
-    pub body: Option<String>,
-}
-
-/// Persistent connection pool state per worker
-pub struct ConnectionPoolState {
-    pub quic_conn: Option<quiche::Connection>,
-    pub h3_conn: Option<quiche::h3::Connection>,
-    pub socket: Option<Arc<UdpSocket>>,
-    pub local_addr: Option<SocketAddr>,
-    pub peer_addr: Option<SocketAddr>,
-    pub next_stream_id: u64,
-    pub reuse_count: usize,
-    pub failed: bool,
-}
-
-impl Default for ConnectionPoolState {
-    fn default() -> Self {
-        Self {
-            quic_conn: None,
-            h3_conn: None,
-            socket: None,
-            local_addr: None,
-            peer_addr: None,
-            next_stream_id: 0,
-            reuse_count: 0,
-            failed: false,
-        }
-    }
-}
+use super::pool::{ConnectionPoolState, ErrorStats, ResponseResult};
 
 pub struct Http3Client {
     config: quiche::Config,
