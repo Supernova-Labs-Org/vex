@@ -112,6 +112,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // Establish persistent connection once per worker
+            if let Err(e) = client.ensure_connected(&target, port, &host).await {
+                eprintln!("Worker {}: Failed to establish connection: {}", worker_id, e);
+                // Continue anyway, will retry on first request
+            }
+
             let mut success = 0;
             let mut fail = 0;
             let mut total_errors = ErrorStats::default();
