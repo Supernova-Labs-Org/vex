@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::net::UdpSocket;
 use crate::utils::resolve_target;
-use super::pool::{ConnectionPoolState, ErrorStats, ResponseResult};
+use super::{constants, pool::{ConnectionPoolState, ErrorStats, ResponseResult}};
 
 pub struct Http3Client {
     config: quiche::Config,
@@ -19,15 +19,15 @@ impl Http3Client {
     pub fn new(insecure: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-        config.set_max_idle_timeout(5_000);
-        config.set_max_recv_udp_payload_size(65_527);
-        config.set_max_send_udp_payload_size(65_527);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
+        config.set_max_idle_timeout(constants::quic::MAX_IDLE_TIMEOUT_MS);
+        config.set_max_recv_udp_payload_size(constants::quic::MAX_RECV_UDP_PAYLOAD_SIZE);
+        config.set_max_send_udp_payload_size(constants::quic::MAX_SEND_UDP_PAYLOAD_SIZE);
+        config.set_initial_max_data(constants::quic::INITIAL_MAX_DATA);
+        config.set_initial_max_stream_data_bidi_local(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config.set_initial_max_stream_data_bidi_remote(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config.set_initial_max_stream_data_uni(constants::quic::INITIAL_MAX_STREAM_DATA_UNI);
+        config.set_initial_max_streams_bidi(constants::quic::MAX_STREAMS_BIDI);
+        config.set_initial_max_streams_uni(constants::quic::MAX_STREAMS_UNI);
         config.enable_early_data();
         config.verify_peer(!insecure);
 
@@ -62,24 +62,24 @@ impl Http3Client {
 
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-        config.set_max_idle_timeout(5_000);
-        config.set_max_recv_udp_payload_size(65_527);
-        config.set_max_send_udp_payload_size(65_527);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
+        config.set_max_idle_timeout(constants::quic::MAX_IDLE_TIMEOUT_MS);
+        config.set_max_recv_udp_payload_size(constants::quic::MAX_RECV_UDP_PAYLOAD_SIZE);
+        config.set_max_send_udp_payload_size(constants::quic::MAX_SEND_UDP_PAYLOAD_SIZE);
+        config.set_initial_max_data(constants::quic::INITIAL_MAX_DATA);
+        config.set_initial_max_stream_data_bidi_local(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config.set_initial_max_stream_data_bidi_remote(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config.set_initial_max_stream_data_uni(constants::quic::INITIAL_MAX_STREAM_DATA_UNI);
+        config.set_initial_max_streams_bidi(constants::quic::MAX_STREAMS_BIDI);
+        config.set_initial_max_streams_uni(constants::quic::MAX_STREAMS_UNI);
         config.enable_early_data();
         config.verify_peer(!self.insecure);
 
         let mut quic_conn = quiche::connect(Some(host), &scid, local_addr, peer_addr, &mut config)?;
 
         // Perform handshake
-        let mut out = [0u8; 65_535];
-        let mut buf = [0u8; 65_535];
-        let handshake_deadline = Instant::now() + Duration::from_secs(5);
+        let mut out = [0u8; constants::network::BUFFER_SIZE];
+        let mut buf = [0u8; constants::network::BUFFER_SIZE];
+        let handshake_deadline = Instant::now() + Duration::from_secs(constants::network::HANDSHAKE_TIMEOUT_SECS);
         let mut h3_conn: Option<quiche::h3::Connection> = None;
 
         loop {
@@ -112,7 +112,7 @@ impl Http3Client {
             }
 
             // Receive packets with timeout
-            let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(50));
+            let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
             match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                 Ok(Ok((len, from))) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -161,8 +161,8 @@ impl Http3Client {
         }
 
         let mut errors = ErrorStats::default();
-        let mut out = [0u8; 65_535];
-        let mut buf = [0u8; 65_535];
+        let mut out = [0u8; constants::network::BUFFER_SIZE];
+        let mut buf = [0u8; constants::network::BUFFER_SIZE];
         let mut stream_id: Option<u64> = None;
 
         // Send request on new stream
@@ -187,7 +187,7 @@ impl Http3Client {
         let mut bytes_received = 0;
         let mut response_body = Vec::new();
 
-        while !response_done && start.elapsed() < Duration::from_secs(5) {
+        while !response_done && start.elapsed() < Duration::from_secs(constants::network::RESPONSE_TIMEOUT_SECS) {
             // Get socket and local_addr outside the critical section
             let (socket, local_addr) = {
                 let pool = &self.pool;
@@ -199,7 +199,7 @@ impl Http3Client {
                 let pool = &mut self.pool;
                 let quic_conn = pool.quic_conn.as_mut().ok_or("Connection lost")?;
 
-                let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(100));
+                let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
 
                 match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                     Ok(Ok((len, from))) => {
@@ -319,7 +319,7 @@ impl Http3Client {
             }
         }
 
-        if start.elapsed() >= Duration::from_secs(5) && !response_done {
+        if start.elapsed() >= Duration::from_secs(constants::network::RESPONSE_TIMEOUT_SECS) && !response_done {
             let pool = &mut self.pool;
             pool.failed = true;
             return Err("timeout waiting for response".into());
