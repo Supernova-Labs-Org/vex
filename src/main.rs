@@ -54,7 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let host = cli.target.clone();
+    let host = cli.target
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_string();
 
     if cli.concurrency == 0 {
         eprintln!("concurrency must be at least 1");
