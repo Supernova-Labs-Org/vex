@@ -1,7 +1,9 @@
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 pub mod client;
 pub mod utils;
@@ -38,6 +40,9 @@ struct Cli {
 
     #[arg(long, default_value = "2xx", help = "HTTP status codes to consider as success (e.g., '2xx', '2xx,3xx', or specific codes '200,201,301')")]
     success_status: String,
+
+    #[arg(short = 'c', long, default_value = "1", help = "Number of concurrent in-flight requests per worker")]
+    concurrency: usize,
 }
 
 #[tokio::main]
@@ -51,11 +56,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let host = cli.target.clone();
 
+    if cli.concurrency == 0 {
+        eprintln!("concurrency must be at least 1");
+        std::process::exit(1);
+    }
+
     println!("Starting HTTP/3 load test:");
     println!("  Target: {}:{}", cli.target, cli.port);
     println!("  Host: {}", host);
     println!("  Path: {}", cli.path);
     println!("  Workers: {}", cli.workers);
+    println!("  Concurrency per worker: {}", cli.concurrency);
     println!("  Total requests: {}", cli.requests);
     println!("  Duration: {}s", cli.duration);
     println!("  Insecure: {}", cli.insecure);
@@ -90,59 +101,77 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verbose = cli.verbose;
         let success_status = cli.success_status.clone();
         let requests_per_worker = quotient + if worker_id < remainder { 1 } else { 0 };
+        let concurrency = cli.concurrency;
         let deadline = Arc::clone(&deadline);
 
         let handle = tokio::spawn(async move {
-            let mut client = match client::h3_client::Http3Client::new(insecure) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Worker {}: Failed to init client: {}", worker_id, e);
-                    return (0, 0, ErrorStats::default(), HashMap::new(), Vec::new());
-                }
-            };
-
-            // Establish persistent connection once per worker
-            if let Err(e) = client.ensure_connected(&target, port, &host).await {
-                eprintln!("Worker {}: Failed to establish connection: {}", worker_id, e);
-                // Continue anyway, will retry on first request
-            }
-
-            let mut success = 0;
-            let mut fail = 0;
+            let mut success = 0usize;
+            let mut fail = 0usize;
             let mut total_errors = ErrorStats::default();
-            let mut status_codes = HashMap::new();
+            let mut status_codes: HashMap<u16, usize> = HashMap::new();
             let mut latencies = Vec::new();
 
-            for i in 0..requests_per_worker {
-                // Check if we've exceeded the duration deadline
+            // Shared counter of how many requests have been dispatched so far.
+            let dispatched = Arc::new(AtomicUsize::new(0));
+
+            // Spawn a new independent task per in-flight slot; each owns its own
+            // Http3Client so there is no &mut aliasing between concurrent futures.
+            let make_request = |req_index: usize| {
+                let target = target.clone();
+                let host = host.clone();
+                let path = path.clone();
+                let success_status = success_status.clone();
+                tokio::spawn(async move {
+                    let mut c = client::h3_client::Http3Client::new(insecure)
+                        .map_err(|e| format!("init: {e}"))?;
+                    let result = c.send_request(&target, port, &host, &path, verbose)
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                    let ok = is_success_status(result.status_code, &success_status);
+                    Ok::<_, String>((req_index, ok, result))
+                })
+            };
+
+            // Seed the in-flight set up to `concurrency` slots.
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+            for _ in 0..concurrency {
                 if Instant::now() >= *deadline {
                     break;
                 }
+                let i = dispatched.fetch_add(1, Ordering::Relaxed);
+                if i >= requests_per_worker {
+                    break;
+                }
+                in_flight.push(make_request(i));
+            }
 
-                match client.send_request(&target, port, &host, &path, verbose).await {
-                    Ok(result) => {
-                        // Track status code
+            // Drive the set: as each completes, record the result and backfill.
+            while let Some(join_result) = in_flight.next().await {
+                match join_result {
+                    Ok(Ok((_i, ok, result))) => {
                         *status_codes.entry(result.status_code).or_insert(0) += 1;
-
-                        // Classify as success/fail based on success_status pattern
-                        if is_success_status(result.status_code, &success_status) {
-                            success += 1;
-                        } else {
-                            fail += 1;
-                        }
-
-                        // Accumulate errors
+                        if ok { success += 1; } else { fail += 1; }
                         total_errors.send_errors += result.errors.send_errors;
                         total_errors.recv_errors += result.errors.recv_errors;
                         total_errors.quic_errors += result.errors.quic_errors;
                         total_errors.stream_reset_errors += result.errors.stream_reset_errors;
-
-                        // Record latency
                         latencies.push(result.latency_ms);
                     }
-                    Err(e) => {
-                        eprintln!("Worker {}: Request {} failed: {}", worker_id, i, e);
+                    Ok(Err(e)) => {
+                        eprintln!("Worker {worker_id}: request failed: {e}");
                         fail += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Worker {worker_id}: task panicked: {e}");
+                        fail += 1;
+                    }
+                }
+
+                // Backfill: try to keep `concurrency` slots busy.
+                if Instant::now() < *deadline {
+                    let i = dispatched.fetch_add(1, Ordering::Relaxed);
+                    if i < requests_per_worker {
+                        in_flight.push(make_request(i));
                     }
                 }
             }
