@@ -148,10 +148,9 @@ impl Http3Client {
         let mut errors = ErrorStats::default();
         let mut out = [0u8; constants::network::BUFFER_SIZE];
         let mut buf = [0u8; constants::network::BUFFER_SIZE];
-        let mut stream_id: Option<u64> = None;
 
-        // Send request on new stream
-        {
+        // Send request and capture the stream ID quiche assigned to it.
+        let stream_id = {
             let pool = &mut self.pool;
             let quic_conn = pool.quic_conn.as_mut().ok_or("Connection lost")?;
             let h3_conn = pool.h3_conn.as_mut().ok_or("Connection lost")?;
@@ -163,8 +162,8 @@ impl Http3Client {
                 Header::new(b":path", path.as_bytes()),
                 Header::new(b"user-agent", b"vex-h3-client"),
             ];
-            h3_conn.send_request(quic_conn, &req, true)?;
-        }
+            h3_conn.send_request(quic_conn, &req, true)?
+        };
 
         // Flush QUIC packets and handle response with minimal locking
         let mut response_done = false;
@@ -231,53 +230,48 @@ impl Http3Client {
                 loop {
                     match h3_conn.poll(quic_conn) {
                         Ok((id, quiche::h3::Event::Headers { list, .. })) => {
-                            if stream_id.is_none() {
-                                stream_id = Some(id);
+                            if id != stream_id {
+                                continue;
                             }
-                            // Only process headers for our stream
-                            if stream_id == Some(id) {
-                                for h in list {
-                                    let name = String::from_utf8_lossy(h.name());
-                                    let value = String::from_utf8_lossy(h.value());
+                            for h in list {
+                                let name = String::from_utf8_lossy(h.name());
+                                let value = String::from_utf8_lossy(h.value());
 
-                                    if name == ":status" {
-                                        if let Ok(code) = value.parse::<u16>() {
-                                            status_code = Some(code);
-                                        }
+                                if name == ":status" {
+                                    if let Ok(code) = value.parse::<u16>() {
+                                        status_code = Some(code);
                                     }
+                                }
 
-                                    if verbose {
-                                        println!("{name}: {value}");
-                                    }
+                                if verbose {
+                                    println!("{name}: {value}");
                                 }
                             }
                         }
                         Ok((id, quiche::h3::Event::Data)) => {
-                            if stream_id.is_none() {
-                                stream_id = Some(id);
+                            if id != stream_id {
+                                continue;
                             }
-                            // Only process data for our stream
-                            if stream_id == Some(id) {
-                                loop {
-                                    match h3_conn.recv_body(quic_conn, id, &mut buf) {
-                                        Ok(read) => {
-                                            bytes_received += read;
-                                            if verbose {
-                                                response_body.extend_from_slice(&buf[..read]);
-                                            }
+                            loop {
+                                match h3_conn.recv_body(quic_conn, id, &mut buf) {
+                                    Ok(read) => {
+                                        bytes_received += read;
+                                        if verbose {
+                                            response_body.extend_from_slice(&buf[..read]);
                                         }
-                                        Err(quiche::h3::Error::Done) => break,
-                                        Err(e) => {
-                                            eprintln!("recv_body error: {:?}", e);
-                                            errors.quic_errors += 1;
-                                        }
+                                    }
+                                    Err(quiche::h3::Error::Done) => break,
+                                    Err(e) => {
+                                        eprintln!("recv_body error: {:?}", e);
+                                        errors.quic_errors += 1;
+                                        response_done = true;
+                                        break;
                                     }
                                 }
                             }
                         }
                         Ok((id, quiche::h3::Event::Finished)) => {
-                            // Only mark done if this is our stream
-                            if stream_id == Some(id) {
+                            if id == stream_id {
                                 response_done = true;
                                 break;
                             }
@@ -289,7 +283,7 @@ impl Http3Client {
                             break;
                         }
                         Ok((_id, quiche::h3::Event::Reset(sid))) => {
-                            if stream_id == Some(sid) {
+                            if sid == stream_id {
                                 eprintln!("Stream reset by peer");
                                 errors.stream_reset_errors += 1;
                                 response_done = true;
