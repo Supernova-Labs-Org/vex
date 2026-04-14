@@ -9,7 +9,7 @@ pub mod client;
 pub mod utils;
 
 use client::ErrorStats;
-use utils::{percentile, is_success_status, parse_target};
+use utils::{percentile, is_success_status, parse_target, resolve_target};
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -57,12 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse target into bare hostname and effective port.
     // server_name is used for SNI (must be host-only, no port).
     // authority is used for the HTTP/3 :authority header (host:port when non-default).
+    // peer_addr is resolved once here and shared across all workers/slots.
     let (server_name, effective_port) = parse_target(&cli.target, cli.port)?;
     let authority = if effective_port == 443 {
         server_name.clone()
     } else {
         format!("{}:{}", server_name, effective_port)
     };
+    let peer_addr = resolve_target(&cli.target, cli.port)?;
 
     if cli.concurrency == 0 {
         eprintln!("concurrency must be at least 1");
@@ -101,10 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let remainder = cli.requests % cli.workers;
 
     for worker_id in 0..cli.workers {
-        let target = cli.target.clone();
         let server_name = server_name.clone();
         let authority = authority.clone();
-        let port = effective_port;
         let path = cli.path.clone();
         let insecure = cli.insecure;
         let verbose = cli.verbose;
@@ -127,7 +127,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // its QUIC connection across many sequential requests. Slots run as
             // concurrent tasks; FuturesUnordered drives them in parallel.
             let make_slot = |slot_id: usize| {
-                let target = target.clone();
                 let server_name = server_name.clone();
                 let authority = authority.clone();
                 let path = path.clone();
@@ -135,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let dispatched = Arc::clone(&dispatched);
                 let deadline = Arc::clone(&deadline);
                 tokio::spawn(async move {
-                    let mut client = client::h3_client::Http3Client::new(insecure)
+                    let mut client = client::h3_client::Http3Client::new(insecure, peer_addr)
                         .map_err(|e| format!("slot {slot_id} init: {e}"))?;
                     let mut slot_results = Vec::new();
 
@@ -148,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                         let result = client
-                            .send_request(&target, port, &server_name, &authority, &path, verbose)
+                            .send_request(&server_name, &authority, &path, verbose)
                             .await
                             .map_err(|e| format!("{e}"))?;
                         let ok = is_success_status(result.status_code, &success_status);

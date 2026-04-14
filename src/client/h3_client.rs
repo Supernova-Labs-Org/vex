@@ -6,18 +6,19 @@ use std::{
     sync::Arc,
 };
 use tokio::net::UdpSocket;
-use crate::utils::resolve_target;
 use super::{constants, pool::{ConnectionPoolState, ErrorStats, ResponseResult}};
 
 pub struct Http3Client {
     pub insecure: bool,
+    peer_addr: SocketAddr,
     pool: ConnectionPoolState,
 }
 
 impl Http3Client {
-    pub fn new(insecure: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(insecure: bool, peer_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             insecure,
+            peer_addr,
             pool: ConnectionPoolState::default(),
         })
     }
@@ -41,8 +42,6 @@ impl Http3Client {
 
     pub async fn ensure_connected(
         &mut self,
-        target: &str,
-        port: u16,
         server_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Reuse the existing connection if it is healthy.
@@ -50,8 +49,7 @@ impl Http3Client {
             return Ok(());
         }
 
-        // Resolve target
-        let peer_addr = resolve_target(target, port)?;
+        let peer_addr = self.peer_addr;
         let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
@@ -128,8 +126,6 @@ impl Http3Client {
 
     pub async fn send_request(
         &mut self,
-        target: &str,
-        port: u16,
         server_name: &str,
         authority: &str,
         path: &str,
@@ -138,7 +134,7 @@ impl Http3Client {
         let start = Instant::now();
 
         // Ensure connection is established (reuses if available)
-        self.ensure_connected(target, port, server_name).await?;
+        self.ensure_connected(server_name).await?;
 
         // Verify the connection is actually usable before proceeding
         {
