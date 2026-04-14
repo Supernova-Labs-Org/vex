@@ -10,13 +10,19 @@ use crate::utils::resolve_target;
 use super::{constants, pool::{ConnectionPoolState, ErrorStats, ResponseResult}};
 
 pub struct Http3Client {
-    config: quiche::Config,
     pub insecure: bool,
     pool: ConnectionPoolState,
 }
 
 impl Http3Client {
     pub fn new(insecure: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            insecure,
+            pool: ConnectionPoolState::default(),
+        })
+    }
+
+    fn build_quic_config(&self) -> Result<quiche::Config, Box<dyn std::error::Error>> {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
         config.set_max_idle_timeout(constants::quic::MAX_IDLE_TIMEOUT_MS);
@@ -29,23 +35,16 @@ impl Http3Client {
         config.set_initial_max_streams_bidi(constants::quic::MAX_STREAMS_BIDI);
         config.set_initial_max_streams_uni(constants::quic::MAX_STREAMS_UNI);
         config.enable_early_data();
-        config.verify_peer(!insecure);
-
-        Ok(Self {
-            config,
-            insecure,
-            pool: ConnectionPoolState::default(),
-        })
+        config.verify_peer(!self.insecure);
+        Ok(config)
     }
 
     pub async fn ensure_connected(
         &mut self,
         target: &str,
         port: u16,
-        host: &str,
+        server_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let pool = &mut self.pool;
-
         // Fresh connection per request (connection reuse has stream ID issues)
         // Increased handshake timeout to handle concurrent TLS negotiations
 
@@ -60,21 +59,8 @@ impl Http3Client {
         rand::thread_rng().fill_bytes(&mut scid_bytes);
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-        config.set_max_idle_timeout(constants::quic::MAX_IDLE_TIMEOUT_MS);
-        config.set_max_recv_udp_payload_size(constants::quic::MAX_RECV_UDP_PAYLOAD_SIZE);
-        config.set_max_send_udp_payload_size(constants::quic::MAX_SEND_UDP_PAYLOAD_SIZE);
-        config.set_initial_max_data(constants::quic::INITIAL_MAX_DATA);
-        config.set_initial_max_stream_data_bidi_local(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
-        config.set_initial_max_stream_data_bidi_remote(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
-        config.set_initial_max_stream_data_uni(constants::quic::INITIAL_MAX_STREAM_DATA_UNI);
-        config.set_initial_max_streams_bidi(constants::quic::MAX_STREAMS_BIDI);
-        config.set_initial_max_streams_uni(constants::quic::MAX_STREAMS_UNI);
-        config.enable_early_data();
-        config.verify_peer(!self.insecure);
-
-        let mut quic_conn = quiche::connect(Some(host), &scid, local_addr, peer_addr, &mut config)?;
+        let mut config = self.build_quic_config()?;
+        let mut quic_conn = quiche::connect(Some(server_name), &scid, local_addr, peer_addr, &mut config)?;
 
         // Perform handshake
         let mut out = [0u8; constants::network::BUFFER_SIZE];
@@ -128,12 +114,12 @@ impl Http3Client {
         }
 
         // Store in pool
-        pool.quic_conn = Some(quic_conn);
-        pool.h3_conn = h3_conn;
-        pool.socket = Some(Arc::new(socket));
-        pool.local_addr = Some(local_addr);
-        pool.peer_addr = Some(peer_addr);
-        pool.failed = false;
+        self.pool.quic_conn = Some(quic_conn);
+        self.pool.h3_conn = h3_conn;
+        self.pool.socket = Some(Arc::new(socket));
+        self.pool.local_addr = Some(local_addr);
+        self.pool.peer_addr = Some(peer_addr);
+        self.pool.failed = false;
 
         Ok(())
     }
@@ -142,19 +128,20 @@ impl Http3Client {
         &mut self,
         target: &str,
         port: u16,
-        host: &str,
+        server_name: &str,
+        authority: &str,
         path: &str,
         verbose: bool,
     ) -> Result<ResponseResult, Box<dyn std::error::Error>> {
         let start = Instant::now();
 
         // Ensure connection is established (reuses if available)
-        self.ensure_connected(target, port, host).await?;
+        self.ensure_connected(target, port, server_name).await?;
 
-        // Increment reuse count for metrics
+        // Verify the connection is actually usable before proceeding
         {
             let pool = &mut self.pool;
-            if pool.quic_conn.is_none() || pool.h3_conn.is_none() || pool.socket.is_none() {
+            if !pool.is_usable() {
                 return Err("Connection lost".into());
             }
             pool.reuse_count += 1;
@@ -174,7 +161,7 @@ impl Http3Client {
             let req = vec![
                 Header::new(b":method", b"GET"),
                 Header::new(b":scheme", b"https"),
-                Header::new(b":authority", host.as_bytes()),
+                Header::new(b":authority", authority.as_bytes()),
                 Header::new(b":path", path.as_bytes()),
                 Header::new(b"user-agent", b"vex-h3-client"),
             ];
@@ -296,7 +283,7 @@ impl Http3Client {
                         }
                         Ok((_id, quiche::h3::Event::PriorityUpdate)) => {}
                         Ok((_id, quiche::h3::Event::GoAway)) => {
-                            pool.failed = true;
+                            pool.mark_failed();
                             response_done = true;
                             break;
                         }
@@ -320,8 +307,7 @@ impl Http3Client {
         }
 
         if start.elapsed() >= Duration::from_secs(constants::network::RESPONSE_TIMEOUT_SECS) && !response_done {
-            let pool = &mut self.pool;
-            pool.failed = true;
+            self.pool.mark_failed();
             return Err("timeout waiting for response".into());
         }
 

@@ -9,7 +9,7 @@ pub mod client;
 pub mod utils;
 
 use client::ErrorStats;
-use utils::{percentile, is_success_status};
+use utils::{percentile, is_success_status, parse_target};
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -54,10 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let host = cli.target
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .to_string();
+    // Parse target into bare hostname and effective port.
+    // server_name is used for SNI (must be host-only, no port).
+    // authority is used for the HTTP/3 :authority header (host:port when non-default).
+    let (server_name, effective_port) = parse_target(&cli.target, cli.port)?;
+    let authority = if effective_port == 443 {
+        server_name.clone()
+    } else {
+        format!("{}:{}", server_name, effective_port)
+    };
 
     if cli.concurrency == 0 {
         eprintln!("concurrency must be at least 1");
@@ -65,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Starting HTTP/3 load test:");
-    println!("  Target: {}:{}", cli.target, cli.port);
-    println!("  Host: {}", host);
+    println!("  Target: {}:{}", cli.target, effective_port);
+    println!("  Host: {}", authority);
     println!("  Path: {}", cli.path);
     println!("  Workers: {}", cli.workers);
     println!("  Concurrency per worker: {}", cli.concurrency);
@@ -97,8 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for worker_id in 0..cli.workers {
         let target = cli.target.clone();
-        let port = cli.port;
-        let host = host.clone();
+        let server_name = server_name.clone();
+        let authority = authority.clone();
+        let port = effective_port;
         let path = cli.path.clone();
         let insecure = cli.insecure;
         let verbose = cli.verbose;
@@ -121,13 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Http3Client so there is no &mut aliasing between concurrent futures.
             let make_request = |req_index: usize| {
                 let target = target.clone();
-                let host = host.clone();
+                let server_name = server_name.clone();
+                let authority = authority.clone();
                 let path = path.clone();
                 let success_status = success_status.clone();
                 tokio::spawn(async move {
                     let mut c = client::h3_client::Http3Client::new(insecure)
                         .map_err(|e| format!("init: {e}"))?;
-                    let result = c.send_request(&target, port, &host, &path, verbose)
+                    let result = c.send_request(&target, port, &server_name, &authority, &path, verbose)
                         .await
                         .map_err(|e| format!("{e}"))?;
                     let ok = is_success_status(result.status_code, &success_status);
