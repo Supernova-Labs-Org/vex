@@ -168,7 +168,8 @@ impl Http3Client {
 
         // Flush QUIC packets and handle response with minimal locking
         let mut response_done = false;
-        let mut status_code = 0u16;
+        let mut premature_close = false;
+        let mut status_code: Option<u16> = None;
         let mut bytes_received = 0;
         let mut response_body = Vec::new();
 
@@ -223,6 +224,7 @@ impl Http3Client {
 
                 if quic_conn.is_closed() {
                     pool.mark_failed();
+                    premature_close = true;
                     break;
                 }
 
@@ -240,7 +242,7 @@ impl Http3Client {
 
                                     if name == ":status" {
                                         if let Ok(code) = value.parse::<u16>() {
-                                            status_code = code;
+                                            status_code = Some(code);
                                         }
                                     }
 
@@ -309,6 +311,15 @@ impl Http3Client {
             self.pool.mark_failed();
             return Err("timeout waiting for response".into());
         }
+
+        if premature_close {
+            return Err("connection closed before response completed".into());
+        }
+
+        let status_code = match status_code {
+            Some(code) => code,
+            None => return Err("response completed without :status header".into()),
+        };
 
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
         let body = if verbose {
