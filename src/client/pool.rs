@@ -26,14 +26,14 @@ pub struct ResponseResult {
 /// Persistent connection pool state per worker
 ///
 /// Maintains a single QUIC connection and H3 connection for reuse across
-/// multiple requests within a worker task. Tracks stream IDs and connection state.
+/// multiple requests within a worker task. Connection is fresh per request;
+/// reuse_count tracks how many requests this worker has dispatched.
 pub struct ConnectionPoolState {
     pub quic_conn: Option<quiche::Connection>,
     pub h3_conn: Option<h3::Connection>,
     pub socket: Option<Arc<UdpSocket>>,
     pub local_addr: Option<SocketAddr>,
     pub peer_addr: Option<SocketAddr>,
-    pub next_stream_id: u64,
     pub reuse_count: usize,
     pub failed: bool,
 }
@@ -46,7 +46,6 @@ impl Default for ConnectionPoolState {
             socket: None,
             local_addr: None,
             peer_addr: None,
-            next_stream_id: 0,
             reuse_count: 0,
             failed: false,
         }
@@ -54,17 +53,7 @@ impl Default for ConnectionPoolState {
 }
 
 impl ConnectionPoolState {
-    /// Allocate next stream ID and increment counter
-    ///
-    /// QUIC uses 0, 4, 8, 12... for bidirectional streams from client
-    pub fn allocate_stream_id(&mut self) -> u64 {
-        let id = self.next_stream_id;
-        self.next_stream_id += 4;
-        self.reuse_count += 1;
-        id
-    }
-
-    /// Reset connection state (e.g., after GOAWAY)
+    /// Mark connection as failed (e.g., after GOAWAY or timeout)
     pub fn mark_failed(&mut self) {
         self.failed = true;
     }
