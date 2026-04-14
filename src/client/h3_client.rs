@@ -45,8 +45,10 @@ impl Http3Client {
         port: u16,
         server_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Fresh connection per request (connection reuse has stream ID issues)
-        // Increased handshake timeout to handle concurrent TLS negotiations
+        // Reuse the existing connection if it is healthy.
+        if self.pool.is_usable() {
+            return Ok(());
+        }
 
         // Resolve target
         let peer_addr = resolve_target(target, port)?;
@@ -224,6 +226,7 @@ impl Http3Client {
                 let h3_conn = pool.h3_conn.as_mut().ok_or("Connection lost")?;
 
                 if quic_conn.is_closed() {
+                    pool.mark_failed();
                     break;
                 }
 
