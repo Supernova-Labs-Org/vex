@@ -9,7 +9,7 @@ pub mod client;
 pub mod utils;
 
 use client::ErrorStats;
-use utils::{percentile, is_success_status, parse_target};
+use utils::{percentile, is_success_status, parse_target, resolve_target};
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -57,12 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse target into bare hostname and effective port.
     // server_name is used for SNI (must be host-only, no port).
     // authority is used for the HTTP/3 :authority header (host:port when non-default).
+    // peer_addr is resolved once here and shared across all workers/slots.
     let (server_name, effective_port) = parse_target(&cli.target, cli.port)?;
     let authority = if effective_port == 443 {
         server_name.clone()
     } else {
         format!("{}:{}", server_name, effective_port)
     };
+    let peer_addr = resolve_target(&cli.target, cli.port)?;
 
     if cli.concurrency == 0 {
         eprintln!("concurrency must be at least 1");
@@ -101,10 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let remainder = cli.requests % cli.workers;
 
     for worker_id in 0..cli.workers {
-        let target = cli.target.clone();
         let server_name = server_name.clone();
         let authority = authority.clone();
-        let port = effective_port;
         let path = cli.path.clone();
         let insecure = cli.insecure;
         let verbose = cli.verbose;
@@ -120,68 +120,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
             let mut latencies = Vec::new();
 
-            // Shared counter of how many requests have been dispatched so far.
+            // Shared counter of requests claimed across all slots in this worker.
             let dispatched = Arc::new(AtomicUsize::new(0));
 
-            // Spawn a new independent task per in-flight slot; each owns its own
-            // Http3Client so there is no &mut aliasing between concurrent futures.
-            let make_request = |req_index: usize| {
-                let target = target.clone();
+            // Each concurrency slot owns a persistent Http3Client so it can reuse
+            // its QUIC connection across many sequential requests. Slots run as
+            // concurrent tasks; FuturesUnordered drives them in parallel.
+            let make_slot = |slot_id: usize| {
                 let server_name = server_name.clone();
                 let authority = authority.clone();
                 let path = path.clone();
                 let success_status = success_status.clone();
+                let dispatched = Arc::clone(&dispatched);
+                let deadline = Arc::clone(&deadline);
                 tokio::spawn(async move {
-                    let mut c = client::h3_client::Http3Client::new(insecure)
-                        .map_err(|e| format!("init: {e}"))?;
-                    let result = c.send_request(&target, port, &server_name, &authority, &path, verbose)
-                        .await
-                        .map_err(|e| format!("{e}"))?;
-                    let ok = is_success_status(result.status_code, &success_status);
-                    Ok::<_, String>((req_index, ok, result))
+                    let mut client = client::h3_client::Http3Client::new(insecure, peer_addr)
+                        .map_err(|e| format!("slot {slot_id} init: {e}"))?;
+                    let mut slot_results = Vec::new();
+
+                    loop {
+                        if Instant::now() >= *deadline {
+                            break;
+                        }
+                        let i = dispatched.fetch_add(1, Ordering::Relaxed);
+                        if i >= requests_per_worker {
+                            break;
+                        }
+                        let result = client
+                            .send_request(&server_name, &authority, &path, verbose)
+                            .await
+                            .map_err(|e| format!("{e}"))?;
+                        let ok = is_success_status(result.status_code, &success_status);
+                        slot_results.push((ok, result));
+                    }
+
+                    Ok::<_, String>(slot_results)
                 })
             };
 
-            // Seed the in-flight set up to `concurrency` slots.
+            // Launch one persistent slot per concurrency unit.
             let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-            for _ in 0..concurrency {
-                if Instant::now() >= *deadline {
-                    break;
-                }
-                let i = dispatched.fetch_add(1, Ordering::Relaxed);
-                if i >= requests_per_worker {
-                    break;
-                }
-                in_flight.push(make_request(i));
+            for slot_id in 0..concurrency {
+                in_flight.push(make_slot(slot_id));
             }
 
-            // Drive the set: as each completes, record the result and backfill.
+            // Collect results as slots finish.
             while let Some(join_result) = in_flight.next().await {
                 match join_result {
-                    Ok(Ok((_i, ok, result))) => {
-                        *status_codes.entry(result.status_code).or_insert(0) += 1;
-                        if ok { success += 1; } else { fail += 1; }
-                        total_errors.send_errors += result.errors.send_errors;
-                        total_errors.recv_errors += result.errors.recv_errors;
-                        total_errors.quic_errors += result.errors.quic_errors;
-                        total_errors.stream_reset_errors += result.errors.stream_reset_errors;
-                        latencies.push(result.latency_ms);
+                    Ok(Ok(slot_results)) => {
+                        for (ok, result) in slot_results {
+                            *status_codes.entry(result.status_code).or_insert(0) += 1;
+                            if ok { success += 1; } else { fail += 1; }
+                            total_errors.send_errors += result.errors.send_errors;
+                            total_errors.recv_errors += result.errors.recv_errors;
+                            total_errors.quic_errors += result.errors.quic_errors;
+                            total_errors.stream_reset_errors += result.errors.stream_reset_errors;
+                            latencies.push(result.latency_ms);
+                        }
                     }
                     Ok(Err(e)) => {
-                        eprintln!("Worker {worker_id}: request failed: {e}");
+                        eprintln!("Worker {worker_id}: slot failed: {e}");
                         fail += 1;
                     }
                     Err(e) => {
-                        eprintln!("Worker {worker_id}: task panicked: {e}");
+                        eprintln!("Worker {worker_id}: slot panicked: {e}");
                         fail += 1;
-                    }
-                }
-
-                // Backfill: try to keep `concurrency` slots busy.
-                if Instant::now() < *deadline {
-                    let i = dispatched.fetch_add(1, Ordering::Relaxed);
-                    if i < requests_per_worker {
-                        in_flight.push(make_request(i));
                     }
                 }
             }
