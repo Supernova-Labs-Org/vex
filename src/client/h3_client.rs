@@ -1,12 +1,20 @@
 use quiche::{self, h3::{Header, NameValue}};
 use rand::RngCore;
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     time::{Duration, Instant},
     sync::Arc,
 };
 use tokio::net::UdpSocket;
 use super::{constants, pool::{ConnectionPoolState, ErrorStats, ResponseResult}};
+
+fn bind_addr_for_peer(peer_addr: SocketAddr) -> SocketAddr {
+    if peer_addr.is_ipv6() {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    }
+}
 
 pub struct Http3Client {
     pub insecure: bool,
@@ -50,7 +58,7 @@ impl Http3Client {
         }
 
         let peer_addr = self.peer_addr;
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse()?;
+        let bind_addr = bind_addr_for_peer(peer_addr);
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
 
@@ -102,10 +110,15 @@ impl Http3Client {
             match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                 Ok(Ok((len, from))) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
-                    let _ = quic_conn.recv(&mut buf[..len], recv_info);
+                    match quic_conn.recv(&mut buf[..len], recv_info) {
+                        Ok(_) | Err(quiche::Error::Done) => {}
+                        Err(err) => {
+                            return Err(format!("quic recv failed during handshake: {:?}", err).into());
+                        }
+                    }
                 }
-                Ok(Err(_)) => {
-                    return Err("socket recv failed".into());
+                Ok(Err(err)) => {
+                    return Err(format!("socket recv failed during handshake: {}", err).into());
                 }
                 Err(_) => {
                     quic_conn.on_timeout();
@@ -189,7 +202,13 @@ impl Http3Client {
                 match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                     Ok(Ok((len, from))) => {
                         let recv_info = quiche::RecvInfo { from, to: local_addr };
-                        let _ = quic_conn.recv(&mut buf[..len], recv_info);
+                        match quic_conn.recv(&mut buf[..len], recv_info) {
+                            Ok(_) | Err(quiche::Error::Done) => {}
+                            Err(err) => {
+                                eprintln!("quic recv failed: {:?}", err);
+                                errors.quic_errors += 1;
+                            }
+                        }
                     }
                     Ok(Err(e)) => {
                         eprintln!("socket recv_from error: {}", e);
@@ -237,10 +256,10 @@ impl Http3Client {
                                 let name = String::from_utf8_lossy(h.name());
                                 let value = String::from_utf8_lossy(h.value());
 
-                                if name == ":status" {
-                                    if let Ok(code) = value.parse::<u16>() {
-                                        status_code = Some(code);
-                                    }
+                                if name == ":status"
+                                    && let Ok(code) = value.parse::<u16>()
+                                {
+                                    status_code = Some(code);
                                 }
 
                                 if verbose {
@@ -329,5 +348,25 @@ impl Http3Client {
             latency_ms,
             body,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_addr_for_peer;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn bind_addr_matches_ipv4_peer_family() {
+        let peer = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 10), 443));
+        let bind = bind_addr_for_peer(peer);
+        assert!(bind.is_ipv4());
+    }
+
+    #[test]
+    fn bind_addr_matches_ipv6_peer_family() {
+        let peer = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        let bind = bind_addr_for_peer(peer);
+        assert!(bind.is_ipv6());
     }
 }
