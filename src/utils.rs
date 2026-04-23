@@ -130,22 +130,22 @@ pub fn percentile(sorted_values: &[f64], p: f64) -> f64 {
 pub fn is_success_status(status_code: u16, success_pattern: &str) -> bool {
     for part in success_pattern.split(',') {
         let part = part.trim();
-        if part == "2xx" && status_code >= 200 && status_code < 300 {
+        if part == "2xx" && (200..300).contains(&status_code) {
             return true;
         }
-        if part == "3xx" && status_code >= 300 && status_code < 400 {
+        if part == "3xx" && (300..400).contains(&status_code) {
             return true;
         }
-        if part == "4xx" && status_code >= 400 && status_code < 500 {
+        if part == "4xx" && (400..500).contains(&status_code) {
             return true;
         }
-        if part == "5xx" && status_code >= 500 && status_code < 600 {
+        if part == "5xx" && (500..600).contains(&status_code) {
             return true;
         }
-        if let Ok(code) = part.parse::<u16>() {
-            if status_code == code {
-                return true;
-            }
+        if let Ok(code) = part.parse::<u16>()
+            && status_code == code
+        {
+            return true;
         }
     }
     false

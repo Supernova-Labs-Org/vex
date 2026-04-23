@@ -28,6 +28,7 @@ pub struct ResponseResult {
 /// Maintains a single QUIC connection and H3 connection for reuse across
 /// multiple requests within a worker task. Connection is fresh per request;
 /// reuse_count tracks how many requests this worker has dispatched.
+#[derive(Default)]
 pub struct ConnectionPoolState {
     pub quic_conn: Option<quiche::Connection>,
     pub h3_conn: Option<h3::Connection>,
@@ -38,20 +39,6 @@ pub struct ConnectionPoolState {
     pub failed: bool,
 }
 
-impl Default for ConnectionPoolState {
-    fn default() -> Self {
-        Self {
-            quic_conn: None,
-            h3_conn: None,
-            socket: None,
-            local_addr: None,
-            peer_addr: None,
-            reuse_count: 0,
-            failed: false,
-        }
-    }
-}
-
 impl ConnectionPoolState {
     /// Mark connection as failed (e.g., after GOAWAY or timeout)
     pub fn mark_failed(&mut self) {
@@ -60,6 +47,11 @@ impl ConnectionPoolState {
 
     /// Check if connection should be reused
     pub fn is_usable(&self) -> bool {
-        self.quic_conn.is_some() && self.h3_conn.is_some() && self.socket.is_some() && !self.failed
+        let quic_open = self
+            .quic_conn
+            .as_ref()
+            .is_some_and(|quic_conn| !quic_conn.is_closed());
+
+        quic_open && self.h3_conn.is_some() && self.socket.is_some() && !self.failed
     }
 }
