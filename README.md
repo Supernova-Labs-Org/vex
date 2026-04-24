@@ -133,6 +133,43 @@ The completion reason is reported in the output. If the duration expires before 
 
 ---
 
+## Benchmarks
+
+Measured on 2026-04-24 against `google.com` (HTTP/3, redirects counted as success):
+
+```
+cargo run --release -- --target google.com --insecure \
+  --success-status 2xx,3xx -n 1000 --workers 10 -c 100
+```
+
+```
+Total time:         1.10s
+Total requests:     1000
+Successful:         1000
+Failed:             0
+Requests/sec:       907.55
+Completion reason:  All 1000 requests completed
+
+HTTP Status code breakdown:
+  302: 3xx Redirect (1000)
+
+Latency metrics (ms):
+  Min:   283.63
+  Max:  1052.91
+  Avg:   690.64
+  p50:   685.00
+  p90:   854.11
+  p95:   864.72
+  p99:   930.92
+```
+
+> Google closes the QUIC connection after every response, so each request
+> pays a full TLS+QUIC handshake (~300-1000ms). The 907 req/s figure
+> reflects 10 workers × 100 concurrent streams saturating the reconnect
+> pipeline in parallel.
+
+---
+
 ## Dependencies
 
 - Tokio - Async runtime for concurrent request handling
