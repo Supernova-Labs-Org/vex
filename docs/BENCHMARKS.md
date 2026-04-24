@@ -51,6 +51,52 @@ Latency metrics (ms):
 
 ---
 
+## google.com — 10000 requests, 100 workers, 1000 concurrency
+
+```bash
+cargo run --release -- --target google.com --insecure \
+  --success-status 2xx,3xx -n 10000 --workers 100 -c 1000
+```
+
+```
+Starting HTTP/3 load test:
+  Target: google.com:443
+  Host: google.com
+  Path: /
+  Workers: 100
+  Concurrency per worker: 1000
+  Total requests: 10000
+  Duration: 30s
+  Insecure: true
+
+Load test completed:
+  Total time: 8.62s
+  Total requests: 10000
+  Successful requests: 10000
+  Failed requests: 0
+  Requests/sec: 1159.92
+  Completion reason: All 10000 requests completed
+
+HTTP Status code breakdown:
+  302: 3xx Redirect (10000)
+
+Latency metrics (ms):
+  Min:   308.18
+  Max:  3806.45
+  Avg:  1574.87
+  p50:  1434.02
+  p90:  2579.17
+  p95:  2667.30
+  p99:  2795.15
+```
+
+**Notes:**
+- 10× the requests at 10× the concurrency completes in 8.6s with zero failures.
+- Higher p99 (2.8s vs 0.9s) reflects queuing at the reconnect layer — each of the 100 workers is cycling through 1000 concurrent connections against a server that closes after every response.
+- Throughput scales from ~907 to ~1160 req/s as more workers absorb handshake latency in parallel.
+
+---
+
 ## Interpreting Results
 
 | Metric | What it tells you |
