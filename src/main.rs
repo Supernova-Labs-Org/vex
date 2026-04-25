@@ -180,11 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 tokio::select! {
                     // Drive QUIC I/O and H3 event dispatch.
-                    alive = h3.poll_once(), if h3.has_in_flight() => {
-                        if !alive {
-                            let _ = h3.ensure_connected(&server_name).await;
-                        }
-                    }
+                    // When the connection dies, poll_once drains any in-flight
+                    // streams with a "connection replaced" error so their tasks
+                    // complete and flow through pending.next() below.
+                    _alive = h3.poll_once(), if h3.has_in_flight() => {}
                     // A stream receiver resolved.
                     Some(join_result) = pending.next() => {
                         let (ok, result) = match join_result {
@@ -204,6 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 total_errors.quic_errors += r.errors.quic_errors;
                                 total_errors.stream_reset_errors += r.errors.stream_reset_errors;
                                 latencies.push(r.latency_ms);
+                            }
+                            Err(ref e) if e.contains("connection replaced") => {
+                                // Stream was killed when the connection closed mid-flight.
+                                // Undo the dispatch count so the backfill below re-queues it.
+                                dispatched = dispatched.saturating_sub(1);
                             }
                             Err(e) => {
                                 eprintln!("Worker {worker_id}: request failed: {e}");

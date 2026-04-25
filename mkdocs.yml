@@ -51,6 +51,7 @@ nav:
   - Usage:
       - Examples: EXAMPLES.md
       - Metrics & Output: METRICS.md
+      - Benchmarks: BENCHMARKS.md
 
 markdown_extensions:
   - admonition

@@ -71,9 +71,11 @@ impl Http3Client {
             return Ok(());
         }
 
-        // Discard any in-flight state from the dead connection.
+        // poll_once drains in_flight before returning false, so by the time
+        // ensure_connected is called there should be no orphaned streams.
+        // Drain defensively in case ensure_connected is called from other paths.
         for (_, state) in self.in_flight.drain() {
-            let _ = state.tx.send(Err("connection reset before stream completed".into()));
+            let _ = state.tx.send(Err("connection replaced before stream completed".into()));
         }
 
         let peer_addr = self.peer_addr;
@@ -117,7 +119,8 @@ impl Http3Client {
                 h3_conn = Some(quiche::h3::Connection::with_transport(&mut quic_conn, &h3_config)?);
             }
 
-            let timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
+            let quic_timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
+            let timeout = quic_timeout.min(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
             match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                 Ok(Ok((len, from))) => {
                     let recv_info = quiche::RecvInfo { from, to: local_addr };
@@ -189,51 +192,54 @@ impl Http3Client {
             _ => return false,
         };
 
+        let connection_closed;
         {
             let quic_conn = match self.pool.quic_conn.as_mut() {
                 Some(c) => c,
                 None => return false,
             };
 
-            if quic_conn.is_closed() {
-                self.pool.mark_failed();
-                return false;
-            }
+            if !quic_conn.is_closed() {
+                let quic_timeout = quic_conn.timeout()
+                    .unwrap_or(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
+                let timeout = quic_timeout.min(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
 
-            let timeout = quic_conn.timeout()
-                .unwrap_or(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
-
-            match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) => {
-                    let recv_info = quiche::RecvInfo { from, to: local_addr };
-                    if let Err(e) = quic_conn.recv(&mut buf[..len], recv_info) {
-                        if e != quiche::Error::Done {
-                            // Propagate quic error to all waiters.
-                            self.pool.mark_failed();
-                            let msg = format!("quic recv error: {:?}", e);
-                            for (_, state) in self.in_flight.drain() {
-                                let _ = state.tx.send(Err(msg.clone()));
+                match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
+                    Ok(Ok((len, from))) => {
+                        let recv_info = quiche::RecvInfo { from, to: local_addr };
+                        if let Err(e) = quic_conn.recv(&mut buf[..len], recv_info) {
+                            if e != quiche::Error::Done {
+                                // Propagate quic error to all waiters.
+                                self.pool.mark_failed();
+                                let msg = format!("quic recv error: {:?}", e);
+                                for (_, state) in self.in_flight.drain() {
+                                    let _ = state.tx.send(Err(msg.clone()));
+                                }
+                                return false;
                             }
-                            return false;
                         }
                     }
+                    Ok(Err(_)) => {}
+                    Err(_) => { quic_conn.on_timeout(); }
                 }
-                Ok(Err(_)) => {}
-                Err(_) => { quic_conn.on_timeout(); }
+
+                loop {
+                    match quic_conn.send(&mut out) {
+                        Ok((write, send_info)) => {
+                            let _ = socket.send_to(&out[..write], send_info.to).await;
+                        }
+                        Err(quiche::Error::Done) | Err(_) => break,
+                    }
+                }
             }
 
-            loop {
-                match quic_conn.send(&mut out) {
-                    Ok((write, send_info)) => {
-                        let _ = socket.send_to(&out[..write], send_info.to).await;
-                    }
-                    Err(quiche::Error::Done) | Err(_) => break,
-                }
-            }
+            // Re-check after processing — recv may have caused connection close.
+            connection_closed = quic_conn.is_closed();
         }
 
         // Drain H3 events and route to per-stream state.
         let mut finished_streams: Vec<u64> = Vec::new();
+        let mut got_goaway = false;
 
         {
             let quic_conn = match self.pool.quic_conn.as_mut() {
@@ -287,12 +293,9 @@ impl Http3Client {
                         finished_streams.push(id);
                     }
                     Ok((_id, quiche::h3::Event::GoAway)) => {
-                        self.pool.mark_failed();
-                        let msg = "connection received GOAWAY".to_string();
-                        for (_, state) in self.in_flight.drain() {
-                            let _ = state.tx.send(Err(msg.clone()));
-                        }
-                        return false;
+                        // Mark failed after the borrow scope ends — GoAway means
+                        // "don't open new streams", not "abort existing ones".
+                        got_goaway = true;
                     }
                     Ok((_id, quiche::h3::Event::Reset(sid))) => {
                         if let Some(mut state) = self.in_flight.remove(&sid) {
@@ -308,6 +311,10 @@ impl Http3Client {
                     }
                 }
             }
+        }
+
+        if got_goaway {
+            self.pool.mark_failed();
         }
 
         // Resolve finished streams.
@@ -330,6 +337,17 @@ impl Http3Client {
                 };
                 let _ = state.tx.send(result);
             }
+        }
+
+        if connection_closed {
+            self.pool.mark_failed();
+            // Any streams that didn't get a Finished event before the connection
+            // closed will never complete on this connection. Signal them so their
+            // tasks unblock; callers should retry these streams.
+            for (_, state) in self.in_flight.drain() {
+                let _ = state.tx.send(Err("connection replaced before stream completed".into()));
+            }
+            return false;
         }
 
         true
