@@ -1,9 +1,8 @@
 use clap::Parser;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
 
 pub mod client;
 pub mod utils;
@@ -120,71 +119,126 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
             let mut latencies = Vec::new();
 
-            // Shared counter of requests claimed across all slots in this worker.
-            let dispatched = Arc::new(AtomicUsize::new(0));
-
-            // Each concurrency slot owns a persistent Http3Client so it can reuse
-            // its QUIC connection across many sequential requests. Slots run as
-            // concurrent tasks; FuturesUnordered drives them in parallel.
-            let make_slot = |slot_id: usize| {
-                let server_name = server_name.clone();
-                let authority = authority.clone();
-                let path = path.clone();
-                let success_status = success_status.clone();
-                let dispatched = Arc::clone(&dispatched);
-                let deadline = Arc::clone(&deadline);
-                tokio::spawn(async move {
-                    let mut client = client::h3_client::Http3Client::new(insecure, peer_addr)
-                        .map_err(|e| format!("slot {slot_id} init: {e}"))?;
-                    let mut slot_results = Vec::new();
-
-                    loop {
-                        if Instant::now() >= *deadline {
-                            break;
-                        }
-                        let i = dispatched.fetch_add(1, Ordering::Relaxed);
-                        if i >= requests_per_worker {
-                            break;
-                        }
-                        let result = client
-                            .send_request(&server_name, &authority, &path, verbose)
-                            .await
-                            .map_err(|e| format!("{e}"))?;
-                        let ok = is_success_status(result.status_code, &success_status);
-                        slot_results.push((ok, result));
-                    }
-
-                    Ok::<_, String>(slot_results)
-                })
+            // One Http3Client per worker: all concurrent streams share one QUIC
+            // connection. On connection failure we reconnect and keep going.
+            let mut h3 = match client::h3_client::Http3Client::new(insecure, peer_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Worker {worker_id}: init failed: {e}");
+                    return (0, 1, ErrorStats::default(), HashMap::new(), Vec::new());
+                }
             };
 
-            // Launch one persistent slot per concurrency unit.
-            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-            for slot_id in 0..concurrency {
-                in_flight.push(make_slot(slot_id));
+            // Establish the connection before dispatching any streams.
+            if let Err(e) = h3.ensure_connected(&server_name).await {
+                eprintln!("Worker {worker_id}: connect failed: {e}");
+                return (0, 1, ErrorStats::default(), HashMap::new(), Vec::new());
             }
 
-            // Collect results as slots finish.
-            while let Some(join_result) = in_flight.next().await {
-                match join_result {
-                    Ok(Ok(slot_results)) => {
-                        for (ok, result) in slot_results {
-                            *status_codes.entry(result.status_code).or_insert(0) += 1;
-                            if ok { success += 1; } else { fail += 1; }
-                            total_errors.send_errors += result.errors.send_errors;
-                            total_errors.recv_errors += result.errors.recv_errors;
-                            total_errors.quic_errors += result.errors.quic_errors;
-                            total_errors.stream_reset_errors += result.errors.stream_reset_errors;
-                            latencies.push(result.latency_ms);
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        eprintln!("Worker {worker_id}: slot failed: {e}");
-                        fail += 1;
+            let mut dispatched: usize = 0;
+
+            // Receivers for the currently in-flight streams.
+            // We use FuturesUnordered to await them concurrently while also
+            // driving the shared poll loop.
+            let mut pending: FuturesUnordered<
+                tokio::task::JoinHandle<(bool, Result<client::ResponseResult, String>)>
+            > = FuturesUnordered::new();
+
+            // Seed up to `concurrency` streams.
+            for _ in 0..concurrency {
+                if Instant::now() >= *deadline || dispatched >= requests_per_worker { break; }
+                dispatched += 1;
+
+                match h3.dispatch(&authority, &path, verbose) {
+                    Ok((_sid, rx)) => {
+                        let success_status = success_status.clone();
+                        pending.push(tokio::spawn(async move {
+                            let result = rx.await
+                                .unwrap_or_else(|_| Err("channel closed".into()));
+                            let ok = result.as_ref()
+                                .map(|r| is_success_status(r.status_code, &success_status))
+                                .unwrap_or(false);
+                            (ok, result)
+                        }));
                     }
                     Err(e) => {
-                        eprintln!("Worker {worker_id}: slot panicked: {e}");
+                        eprintln!("Worker {worker_id}: dispatch failed: {e}");
                         fail += 1;
+                    }
+                }
+            }
+
+            // Drive the connection and collect results. We select between the
+            // QUIC poll loop and the first completed receiver so neither starves
+            // the other. poll_once() has an internal timeout so it yields
+            // promptly even when no packets arrive.
+            use futures::stream::StreamExt as _;
+            loop {
+                if pending.is_empty() {
+                    break;
+                }
+
+                tokio::select! {
+                    // Drive QUIC I/O and H3 event dispatch.
+                    alive = h3.poll_once(), if h3.has_in_flight() => {
+                        if !alive {
+                            let _ = h3.ensure_connected(&server_name).await;
+                        }
+                    }
+                    // A stream receiver resolved.
+                    Some(join_result) = pending.next() => {
+                        let (ok, result) = match join_result {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                eprintln!("Worker {worker_id}: task panicked: {e}");
+                                fail += 1;
+                                continue;
+                            }
+                        };
+                        match result {
+                            Ok(r) => {
+                                *status_codes.entry(r.status_code).or_insert(0) += 1;
+                                if ok { success += 1; } else { fail += 1; }
+                                total_errors.send_errors += r.errors.send_errors;
+                                total_errors.recv_errors += r.errors.recv_errors;
+                                total_errors.quic_errors += r.errors.quic_errors;
+                                total_errors.stream_reset_errors += r.errors.stream_reset_errors;
+                                latencies.push(r.latency_ms);
+                            }
+                            Err(e) => {
+                                eprintln!("Worker {worker_id}: request failed: {e}");
+                                fail += 1;
+                            }
+                        }
+
+                        // Backfill: keep concurrency slots full.
+                        if Instant::now() < *deadline && dispatched < requests_per_worker {
+                            dispatched += 1;
+                            if !h3.is_connected() {
+                                if let Err(e) = h3.ensure_connected(&server_name).await {
+                                    eprintln!("Worker {worker_id}: reconnect failed: {e}");
+                                    fail += 1;
+                                    continue;
+                                }
+                            }
+                            match h3.dispatch(&authority, &path, verbose) {
+                                Ok((_sid, rx)) => {
+                                    let success_status = success_status.clone();
+                                    pending.push(tokio::spawn(async move {
+                                        let result = rx.await
+                                            .unwrap_or_else(|_| Err("channel closed".into()));
+                                        let ok = result.as_ref()
+                                            .map(|r| is_success_status(r.status_code, &success_status))
+                                            .unwrap_or(false);
+                                        (ok, result)
+                                    }));
+                                }
+                                Err(e) => {
+                                    eprintln!("Worker {worker_id}: dispatch failed: {e}");
+                                    fail += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
