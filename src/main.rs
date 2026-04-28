@@ -443,14 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CompletionReason::AllRequestsCompleted
     };
 
-    // For throughput, use the configured duration as the denominator when
-    // duration-limited so that in-flight work draining past the deadline
-    // does not deflate the reported req/s.
-    let throughput_window = if hit_duration_limit {
-        cli.duration as f64
-    } else {
-        elapsed
-    };
+    let duration_window = cli.duration as f64;
 
     println!("\nLoad test completed:");
     println!("  Total time: {:.2}s", elapsed);
@@ -463,14 +456,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timed_out_requests, cli.request_timeout_ms
         );
     }
-    println!(
-        "  Requests/sec: {:.2}",
-        if throughput_window > 0.0 {
-            total_requests as f64 / throughput_window
-        } else {
-            0.0
-        }
-    );
+    if hit_duration_limit {
+        // In-duration: requests completed ÷ configured window (excludes post-deadline tail).
+        // End-to-end: requests completed ÷ actual wall-clock time (includes post-deadline tail).
+        println!(
+            "  Req/s (in-duration):  {:.2}",
+            if duration_window > 0.0 { total_requests as f64 / duration_window } else { 0.0 }
+        );
+        println!(
+            "  Req/s (end-to-end):   {:.2}",
+            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
+        );
+    } else {
+        println!(
+            "  Requests/sec: {:.2}",
+            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
+        );
+    }
 
     match completion_reason {
         CompletionReason::DurationLimitReached => {
