@@ -78,7 +78,6 @@ vex --target example.com --workers 1 --requests 10 --verbose
 
 Shows:
 - HTTP status and headers for each request
-- Latency for each request
 - Any errors encountered
 
 ## Mixed Constraints
