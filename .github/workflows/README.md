@@ -6,14 +6,14 @@ Automated CI/CD pipelines for vex project.
 
 ### docs.yml - Documentation Build & Deploy
 
-**Triggers:** Push to main/master or PR, when docs files change
+**Triggers:** Push to `master`, pull requests targeting `master`, and manual dispatch
 
 **Steps:**
 1. Checkout code
-2. Setup Python 3.12
+2. Setup Python 3.x
 3. Install mkdocs dependencies
-4. Build documentation with mkdocs
-5. Deploy to GitHub Pages (on push to main/master)
+4. Build documentation with `mkdocs build --strict`
+5. Deploy to GitHub Pages on push to `master`
 
 **Artifacts:** Uploads built site to GitHub Pages
 
@@ -23,21 +23,21 @@ Automated CI/CD pipelines for vex project.
 
 ### ci.yml - Code Quality & Testing
 
-**Triggers:** Push to main/master or any PR
+**Triggers:** Push to `master` and pull requests targeting `master`
 
 **Jobs:**
 
 #### Test
-- Run cargo tests
-- Run clippy linting
-- Check code formatting
+- Run `cargo fmt --check`
+- Run `cargo clippy --all-targets --all-features -- -D warnings`
+- Run `cargo test --all-targets --all-features`
 
 #### Documentation Check
 - Build docs with strict mode
 - Check for broken links (optional)
 
 #### Build Release
-- Build release binary
+- Run `cargo build --release`
 
 **Caching:**
 - Cargo registry, index, and build artifacts cached

@@ -1,13 +1,47 @@
-use quiche::{self, h3::{Header, NameValue}};
+use super::{
+    constants,
+    pool::{ConnectionPoolState, ErrorStats, ResponseResult},
+};
+use quiche::{
+    self,
+    h3::{Header, NameValue},
+};
 use rand::RngCore;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    time::{Duration, Instant},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::oneshot};
-use super::{constants, pool::{ConnectionPoolState, ErrorStats, ResponseResult}};
+
+#[derive(Debug)]
+pub enum DispatchError {
+    ConnectionLost,
+    StreamBlocked,
+    H3(quiche::h3::Error),
+}
+
+impl DispatchError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DispatchError::ConnectionLost | DispatchError::StreamBlocked
+        )
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchError::ConnectionLost => write!(f, "connection lost"),
+            DispatchError::StreamBlocked => write!(f, "stream blocked"),
+            DispatchError::H3(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
 
 fn bind_addr_for_peer(peer_addr: SocketAddr) -> SocketAddr {
     if peer_addr.is_ipv6() {
@@ -21,7 +55,6 @@ fn bind_addr_for_peer(peer_addr: SocketAddr) -> SocketAddr {
 struct StreamState {
     status_code: Option<u16>,
     bytes_received: usize,
-    body: Vec<u8>,
     errors: ErrorStats,
     start: Instant,
     verbose: bool,
@@ -53,8 +86,10 @@ impl Http3Client {
         config.set_max_recv_udp_payload_size(constants::quic::MAX_RECV_UDP_PAYLOAD_SIZE);
         config.set_max_send_udp_payload_size(constants::quic::MAX_SEND_UDP_PAYLOAD_SIZE);
         config.set_initial_max_data(constants::quic::INITIAL_MAX_DATA);
-        config.set_initial_max_stream_data_bidi_local(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
-        config.set_initial_max_stream_data_bidi_remote(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config
+            .set_initial_max_stream_data_bidi_local(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
+        config
+            .set_initial_max_stream_data_bidi_remote(constants::quic::INITIAL_MAX_STREAM_DATA_BIDI);
         config.set_initial_max_stream_data_uni(constants::quic::INITIAL_MAX_STREAM_DATA_UNI);
         config.set_initial_max_streams_bidi(constants::quic::MAX_STREAMS_BIDI);
         config.set_initial_max_streams_uni(constants::quic::MAX_STREAMS_UNI);
@@ -75,7 +110,9 @@ impl Http3Client {
         // ensure_connected is called there should be no orphaned streams.
         // Drain defensively in case ensure_connected is called from other paths.
         for (_, state) in self.in_flight.drain() {
-            let _ = state.tx.send(Err("connection replaced before stream completed".into()));
+            let _ = state
+                .tx
+                .send(Err("connection replaced before stream completed".into()));
         }
 
         let peer_addr = self.peer_addr;
@@ -88,11 +125,13 @@ impl Http3Client {
         let scid = quiche::ConnectionId::from_ref(&scid_bytes);
 
         let mut config = self.build_quic_config()?;
-        let mut quic_conn = quiche::connect(Some(server_name), &scid, local_addr, peer_addr, &mut config)?;
+        let mut quic_conn =
+            quiche::connect(Some(server_name), &scid, local_addr, peer_addr, &mut config)?;
 
         let mut out = [0u8; constants::network::BUFFER_SIZE];
         let mut buf = [0u8; constants::network::BUFFER_SIZE];
-        let handshake_deadline = Instant::now() + Duration::from_secs(constants::network::HANDSHAKE_TIMEOUT_SECS);
+        let handshake_deadline =
+            Instant::now() + Duration::from_secs(constants::network::HANDSHAKE_TIMEOUT_SECS);
         let mut h3_conn: Option<quiche::h3::Connection> = None;
 
         loop {
@@ -108,7 +147,9 @@ impl Http3Client {
 
             loop {
                 match quic_conn.send(&mut out) {
-                    Ok((write, send_info)) => { socket.send_to(&out[..write], send_info.to).await?; }
+                    Ok((write, send_info)) => {
+                        socket.send_to(&out[..write], send_info.to).await?;
+                    }
                     Err(quiche::Error::Done) => break,
                     Err(e) => return Err(format!("send failed: {:?}", e).into()),
                 }
@@ -116,21 +157,39 @@ impl Http3Client {
 
             if quic_conn.is_established() && h3_conn.is_none() {
                 let h3_config = quiche::h3::Config::new()?;
-                h3_conn = Some(quiche::h3::Connection::with_transport(&mut quic_conn, &h3_config)?);
+                h3_conn = Some(quiche::h3::Connection::with_transport(
+                    &mut quic_conn,
+                    &h3_config,
+                )?);
             }
 
-            let quic_timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
-            let timeout = quic_timeout.min(Duration::from_millis(constants::network::HANDSHAKE_POLL_TIMEOUT_MS));
+            let quic_timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(
+                constants::network::HANDSHAKE_POLL_TIMEOUT_MS,
+            ));
+            let timeout = quic_timeout.min(Duration::from_millis(
+                constants::network::HANDSHAKE_POLL_TIMEOUT_MS,
+            ));
             match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                 Ok(Ok((len, from))) => {
-                    let recv_info = quiche::RecvInfo { from, to: local_addr };
+                    let recv_info = quiche::RecvInfo {
+                        from,
+                        to: local_addr,
+                    };
                     match quic_conn.recv(&mut buf[..len], recv_info) {
                         Ok(_) | Err(quiche::Error::Done) => {}
-                        Err(err) => return Err(format!("quic recv failed during handshake: {:?}", err).into()),
+                        Err(err) => {
+                            return Err(
+                                format!("quic recv failed during handshake: {:?}", err).into()
+                            );
+                        }
                     }
                 }
-                Ok(Err(err)) => return Err(format!("socket recv failed during handshake: {}", err).into()),
-                Err(_) => { quic_conn.on_timeout(); }
+                Ok(Err(err)) => {
+                    return Err(format!("socket recv failed during handshake: {}", err).into());
+                }
+                Err(_) => {
+                    quic_conn.on_timeout();
+                }
             }
         }
 
@@ -152,10 +211,13 @@ impl Http3Client {
         authority: &str,
         path: &str,
         verbose: bool,
-    ) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), Box<dyn std::error::Error>> {
+    ) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), DispatchError> {
         let pool = &mut self.pool;
-        let quic_conn = pool.quic_conn.as_mut().ok_or("Connection lost")?;
-        let h3_conn = pool.h3_conn.as_mut().ok_or("Connection lost")?;
+        let quic_conn = pool
+            .quic_conn
+            .as_mut()
+            .ok_or(DispatchError::ConnectionLost)?;
+        let h3_conn = pool.h3_conn.as_mut().ok_or(DispatchError::ConnectionLost)?;
 
         let req = vec![
             Header::new(b":method", b"GET"),
@@ -164,20 +226,48 @@ impl Http3Client {
             Header::new(b":path", path.as_bytes()),
             Header::new(b"user-agent", b"vex-h3-client"),
         ];
-        let stream_id = h3_conn.send_request(quic_conn, &req, true)?;
+        let stream_id = h3_conn.send_request(quic_conn, &req, true).map_err(|e| {
+            if matches!(
+                e,
+                quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done
+            ) {
+                DispatchError::StreamBlocked
+            } else {
+                DispatchError::H3(e)
+            }
+        })?;
 
         let (tx, rx) = oneshot::channel();
-        self.in_flight.insert(stream_id, StreamState {
-            status_code: None,
-            bytes_received: 0,
-            body: Vec::new(),
-            errors: ErrorStats::default(),
-            start: Instant::now(),
-            verbose,
-            tx,
-        });
+        self.in_flight.insert(
+            stream_id,
+            StreamState {
+                status_code: None,
+                bytes_received: 0,
+                errors: ErrorStats::default(),
+                start: Instant::now(),
+                verbose,
+                tx,
+            },
+        );
 
         Ok((stream_id, rx))
+    }
+
+    fn drain_in_flight_with_error(&mut self, message: &str, bump: fn(&mut ErrorStats)) {
+        for (_, mut state) in self.in_flight.drain() {
+            bump(&mut state.errors);
+            let _ = state.tx.send(Err(message.to_string()));
+        }
+    }
+
+    pub fn abandon_stream(&mut self, stream_id: u64) {
+        if let Some(state) = self.in_flight.remove(&stream_id) {
+            let _ = state.tx.send(Err("request timed out".into()));
+        }
+
+        if let Some(quic_conn) = self.pool.quic_conn.as_mut() {
+            let _ = quic_conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0);
+        }
     }
 
     // Run one iteration of the QUIC I/O + H3 poll loop, routing events to
@@ -200,35 +290,51 @@ impl Http3Client {
             };
 
             if !quic_conn.is_closed() {
-                let quic_timeout = quic_conn.timeout()
-                    .unwrap_or(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
-                let timeout = quic_timeout.min(Duration::from_millis(constants::network::RESPONSE_POLL_TIMEOUT_MS));
+                let quic_timeout = quic_conn.timeout().unwrap_or(Duration::from_millis(
+                    constants::network::RESPONSE_POLL_TIMEOUT_MS,
+                ));
+                let timeout = quic_timeout.min(Duration::from_millis(
+                    constants::network::RESPONSE_POLL_TIMEOUT_MS,
+                ));
 
                 match tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await {
                     Ok(Ok((len, from))) => {
-                        let recv_info = quiche::RecvInfo { from, to: local_addr };
-                        if let Err(e) = quic_conn.recv(&mut buf[..len], recv_info) {
-                            if e != quiche::Error::Done {
-                                // Propagate quic error to all waiters.
-                                self.pool.mark_failed();
-                                let msg = format!("quic recv error: {:?}", e);
-                                for (_, state) in self.in_flight.drain() {
-                                    let _ = state.tx.send(Err(msg.clone()));
-                                }
-                                return false;
-                            }
+                        let recv_info = quiche::RecvInfo {
+                            from,
+                            to: local_addr,
+                        };
+                        if let Err(e) = quic_conn.recv(&mut buf[..len], recv_info)
+                            && e != quiche::Error::Done
+                        {
+                            self.pool.mark_failed();
+                            let msg = format!("quic recv error: {:?}", e);
+                            self.drain_in_flight_with_error(&msg, |errors| {
+                                errors.quic_errors += 1;
+                            });
+                            return false;
                         }
                     }
-                    Ok(Err(_)) => {}
-                    Err(_) => { quic_conn.on_timeout(); }
+                    Ok(Err(err)) => {
+                        self.pool.mark_failed();
+                        let msg = format!("socket recv error: {err}");
+                        self.drain_in_flight_with_error(&msg, |errors| {
+                            errors.recv_errors += 1;
+                        });
+                        return false;
+                    }
+                    Err(_) => {
+                        quic_conn.on_timeout();
+                    }
                 }
 
-                loop {
-                    match quic_conn.send(&mut out) {
-                        Ok((write, send_info)) => {
-                            let _ = socket.send_to(&out[..write], send_info.to).await;
-                        }
-                        Err(quiche::Error::Done) | Err(_) => break,
+                while let Ok((write, send_info)) = quic_conn.send(&mut out) {
+                    if let Err(err) = socket.send_to(&out[..write], send_info.to).await {
+                        self.pool.mark_failed();
+                        let msg = format!("socket send error: {err}");
+                        self.drain_in_flight_with_error(&msg, |errors| {
+                            errors.send_errors += 1;
+                        });
+                        return false;
                     }
                 }
             }
@@ -258,10 +364,10 @@ impl Http3Client {
                             for h in list {
                                 let name = String::from_utf8_lossy(h.name());
                                 let value = String::from_utf8_lossy(h.value());
-                                if name == ":status" {
-                                    if let Ok(code) = value.parse::<u16>() {
-                                        state.status_code = Some(code);
-                                    }
+                                if name == ":status"
+                                    && let Ok(code) = value.parse::<u16>()
+                                {
+                                    state.status_code = Some(code);
                                 }
                                 if state.verbose {
                                     println!("{name}: {value}");
@@ -275,9 +381,6 @@ impl Http3Client {
                                 match h3_conn.recv_body(quic_conn, id, &mut buf) {
                                     Ok(read) => {
                                         state.bytes_received += read;
-                                        if state.verbose {
-                                            state.body.extend_from_slice(&buf[..read]);
-                                        }
                                     }
                                     Err(quiche::h3::Error::Done) => break,
                                     Err(e) => {
@@ -307,6 +410,11 @@ impl Http3Client {
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => {
                         eprintln!("h3 poll error: {:?}", e);
+                        self.pool.mark_failed();
+                        let msg = format!("h3 poll error: {:?}", e);
+                        self.drain_in_flight_with_error(&msg, |errors| {
+                            errors.quic_errors += 1;
+                        });
                         break;
                     }
                 }
@@ -328,11 +436,6 @@ impl Http3Client {
                         bytes_received: state.bytes_received,
                         errors: state.errors,
                         latency_ms,
-                        body: if state.verbose {
-                            Some(String::from_utf8_lossy(&state.body).into_owned())
-                        } else {
-                            None
-                        },
                     }),
                 };
                 let _ = state.tx.send(result);
@@ -345,7 +448,9 @@ impl Http3Client {
             // closed will never complete on this connection. Signal them so their
             // tasks unblock; callers should retry these streams.
             for (_, state) in self.in_flight.drain() {
-                let _ = state.tx.send(Err("connection replaced before stream completed".into()));
+                let _ = state
+                    .tx
+                    .send(Err("connection replaced before stream completed".into()));
             }
             return false;
         }
@@ -359,57 +464,6 @@ impl Http3Client {
 
     pub fn is_connected(&self) -> bool {
         self.pool.is_usable()
-    }
-
-    // High-level send_request: dispatch + drive until this stream resolves.
-    // Used when the caller wants a simple sequential interface.
-    pub async fn send_request(
-        &mut self,
-        server_name: &str,
-        authority: &str,
-        path: &str,
-        verbose: bool,
-    ) -> Result<ResponseResult, Box<dyn std::error::Error>> {
-        self.ensure_connected(server_name).await?;
-
-        if !self.pool.is_usable() {
-            return Err("Connection lost".into());
-        }
-        self.pool.reuse_count += 1;
-
-        let (_stream_id, mut rx) = self.dispatch(authority, path, verbose)?;
-
-        let deadline = Instant::now() + Duration::from_secs(constants::network::RESPONSE_TIMEOUT_SECS);
-
-        loop {
-            if Instant::now() >= deadline {
-                self.pool.mark_failed();
-                return Err("timeout waiting for response".into());
-            }
-
-            // Check if our stream already resolved (e.g. result delivered in poll_once).
-            match rx.try_recv() {
-                Ok(result) => return result.map_err(|e| e.into()),
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err("response channel closed unexpectedly".into());
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
-            }
-
-            if !self.poll_once().await {
-                // Connection died; check if our result was delivered before the death.
-                return Err("connection closed before response completed".into());
-            }
-
-            // Re-check after poll_once delivered events.
-            match rx.try_recv() {
-                Ok(result) => return result.map_err(|e| e.into()),
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err("response channel closed unexpectedly".into());
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
-            }
-        }
     }
 }
 

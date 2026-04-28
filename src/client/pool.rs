@@ -19,15 +19,13 @@ pub struct ResponseResult {
     pub bytes_received: usize,
     pub errors: ErrorStats,
     pub latency_ms: f64,
-    /// Body content only captured in verbose mode for debugging
-    pub body: Option<String>,
 }
 
 /// Persistent connection pool state per worker
 ///
 /// Maintains a single QUIC connection and H3 connection for reuse across
-/// multiple requests within a worker task. Connection is fresh per request;
-/// reuse_count tracks how many requests this worker has dispatched.
+/// multiple requests within a worker task. `reuse_count` tracks how many
+/// requests this worker has dispatched.
 #[derive(Default)]
 pub struct ConnectionPoolState {
     pub quic_conn: Option<quiche::Connection>,

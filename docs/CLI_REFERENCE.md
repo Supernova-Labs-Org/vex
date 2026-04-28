@@ -121,6 +121,7 @@ vex --target example.com --success-status 200,201,204,301,302
 ```
 
 This affects the "Successful/Failed requests" counts in the output.
+Invalid tokens (for example `2xy` or `700`) are rejected at startup.
 
 ### `--verbose`
 
@@ -128,7 +129,6 @@ Enable verbose output.
 
 - Default: Disabled
 - Prints response headers for each request (may reduce throughput)
-- Only captures response body when verbose is enabled
 - Useful for debugging
 
 ```bash
