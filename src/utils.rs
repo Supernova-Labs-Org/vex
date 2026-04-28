@@ -12,7 +12,10 @@ use std::net::{SocketAddr, ToSocketAddrs};
 /// - `http://hostname` or `https://hostname` (scheme stripped)
 ///
 /// Port precedence: embedded port > provided port
-pub fn parse_target(target: &str, default_port: u16) -> Result<(String, u16), Box<dyn std::error::Error>> {
+pub fn parse_target(
+    target: &str,
+    default_port: u16,
+) -> Result<(String, u16), Box<dyn std::error::Error>> {
     // Strip scheme if present
     let stripped = target
         .trim_start_matches("https://")

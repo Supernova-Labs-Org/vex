@@ -251,9 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut dispatched = 0usize;
-            let mut pending: FuturesUnordered<
-                tokio::task::JoinHandle<(u64, PendingOutcome)>,
-            > = FuturesUnordered::new();
+            let mut pending: FuturesUnordered<tokio::task::JoinHandle<(u64, PendingOutcome)>> =
+                FuturesUnordered::new();
 
             use futures::stream::StreamExt as _;
             loop {
@@ -262,14 +261,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && dispatched < requests_per_worker
                 {
                     dispatched += 1;
-                    match dispatch_with_retry(
-                        &mut h3,
-                        &server_name,
-                        &authority,
-                        &path,
-                        verbose,
-                    )
-                    .await
+                    match dispatch_with_retry(&mut h3, &server_name, &authority, &path, verbose)
+                        .await
                     {
                         Ok((stream_id, rx)) => {
                             pending.push(spawn_stream_waiter(stream_id, rx));
@@ -435,7 +428,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  QUIC/protocol errors: {}", total_errors.quic_errors);
         }
         if total_errors.stream_reset_errors > 0 {
-            println!("  Stream reset errors: {}", total_errors.stream_reset_errors);
+            println!(
+                "  Stream reset errors: {}",
+                total_errors.stream_reset_errors
+            );
         }
     }
 
@@ -480,7 +476,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if worker_failures > 0 {
-        eprintln!("\nWarning: {} worker(s) failed or panicked", worker_failures);
+        eprintln!(
+            "\nWarning: {} worker(s) failed or panicked",
+            worker_failures
+        );
         eprintln!(
             "This may indicate system instability or resource exhaustion during the load test."
         );
@@ -492,13 +491,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Warning: Request count mismatch! Expected {}, but sent {}",
             cli.requests, total_requests
         );
-        return Err(
-            format!(
-                "Request count mismatch: expected {} but sent {}",
-                cli.requests, total_requests
-            )
-            .into(),
-        );
+        return Err(format!(
+            "Request count mismatch: expected {} but sent {}",
+            cli.requests, total_requests
+        )
+        .into());
     }
 
     Ok(())
