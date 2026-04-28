@@ -141,6 +141,20 @@ async fn dispatch_with_retry(
     Err("dispatch failed unexpectedly".into())
 }
 
+fn print_latency_block(label: &str, sorted: &[f64]) {
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    println!("\n{label}:");
+    println!("  Min:  {:.2}", min);
+    println!("  Max:  {:.2}", max);
+    println!("  Avg:  {:.2}", avg);
+    println!("  p50:  {:.2}", percentile(sorted, 50.0));
+    println!("  p90:  {:.2}", percentile(sorted, 90.0));
+    println!("  p95:  {:.2}", percentile(sorted, 95.0));
+    println!("  p99:  {:.2}", percentile(sorted, 99.0));
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -202,7 +216,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_errors = ErrorStats::default();
     let mut status_code_counts: HashMap<u16, usize> = HashMap::new();
     let mut worker_failures = 0;
-    let mut all_latencies = Vec::new();
+    let mut success_latencies: Vec<f64> = Vec::new();
+    let mut failure_latencies: Vec<f64> = Vec::new();
     let mut hit_duration_limit = false;
 
     let mut handles = vec![];
@@ -226,7 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut timed_out = 0usize;
             let mut total_errors = ErrorStats::default();
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
-            let mut latencies = Vec::new();
+            let mut success_lats: Vec<f64> = Vec::new();
+            let mut failure_lats: Vec<f64> = Vec::new();
             let mut duration_limited = false;
 
             if requests_per_worker == 0 {
@@ -236,7 +252,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     timed_out,
                     total_errors,
                     status_codes,
-                    latencies,
+                    success_lats,
+                    failure_lats,
                     duration_limited,
                 );
             }
@@ -252,6 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ErrorStats::default(),
                         HashMap::new(),
                         Vec::new(),
+                        Vec::new(),
                         false,
                     );
                 }
@@ -265,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                     ErrorStats::default(),
                     HashMap::new(),
+                    Vec::new(),
                     Vec::new(),
                     false,
                 );
@@ -333,21 +352,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 h3.abandon_stream(stream_id);
                                 timed_out += 1;
                                 fail += 1;
+                                failure_lats.push(request_timeout.as_secs_f64() * 1000.0);
                             }
                             PendingOutcome::Completed(result) => {
                                 match result {
                                     Ok(r) => {
                                         *status_codes.entry(r.status_code).or_insert(0) += 1;
-                                        if is_success_status(r.status_code, &success_status) {
-                                            success += 1;
-                                        } else {
-                                            fail += 1;
-                                        }
                                         total_errors.send_errors += r.errors.send_errors;
                                         total_errors.recv_errors += r.errors.recv_errors;
                                         total_errors.quic_errors += r.errors.quic_errors;
                                         total_errors.stream_reset_errors += r.errors.stream_reset_errors;
-                                        latencies.push(r.latency_ms);
+                                        if is_success_status(r.status_code, &success_status) {
+                                            success += 1;
+                                            success_lats.push(r.latency_ms);
+                                        } else {
+                                            fail += 1;
+                                            failure_lats.push(r.latency_ms);
+                                        }
                                     }
                                     Err(ref e) if e.contains("connection replaced") => {
                                         dispatched = dispatched.saturating_sub(1);
@@ -369,7 +390,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timed_out,
                 total_errors,
                 status_codes,
-                latencies,
+                success_lats,
+                failure_lats,
                 duration_limited,
             )
         });
@@ -379,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (worker_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
-            Ok((s, f, t, errors, status_codes, latencies, duration_limited)) => {
+            Ok((s, f, t, errors, status_codes, s_lats, f_lats, duration_limited)) => {
                 total_requests += s + f;
                 successful_requests += s;
                 failed_requests += f;
@@ -394,7 +416,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *status_code_counts.entry(code).or_insert(0) += count;
                 }
 
-                all_latencies.extend(latencies);
+                success_latencies.extend(s_lats);
+                failure_latencies.extend(f_lats);
             }
             Err(join_err) => {
                 worker_failures += 1;
@@ -505,27 +528,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !all_latencies.is_empty() {
-        println!("\nLatency metrics (ms):");
+    if !success_latencies.is_empty() {
+        success_latencies.sort_by(|a, b| a.total_cmp(b));
+        print_latency_block("Latency (successful requests, ms)", &success_latencies);
+    }
 
-        let mut sorted_latencies = all_latencies;
-        sorted_latencies.sort_by(|a, b| a.total_cmp(b));
-
-        let min = sorted_latencies[0];
-        let max = sorted_latencies[sorted_latencies.len() - 1];
-        let avg = sorted_latencies.iter().sum::<f64>() / sorted_latencies.len() as f64;
-        let p50 = percentile(&sorted_latencies, 50.0);
-        let p90 = percentile(&sorted_latencies, 90.0);
-        let p95 = percentile(&sorted_latencies, 95.0);
-        let p99 = percentile(&sorted_latencies, 99.0);
-
-        println!("  Min:  {:.2}", min);
-        println!("  Max:  {:.2}", max);
-        println!("  Avg:  {:.2}", avg);
-        println!("  p50:  {:.2}", p50);
-        println!("  p90:  {:.2}", p90);
-        println!("  p95:  {:.2}", p95);
-        println!("  p99:  {:.2}", p99);
+    if !failure_latencies.is_empty() {
+        failure_latencies.sort_by(|a, b| a.total_cmp(b));
+        print_latency_block("Latency (failed requests, ms)", &failure_latencies);
     }
 
     if worker_failures > 0 {
