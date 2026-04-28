@@ -4,7 +4,7 @@ site_author: Nishant
 site_url: https://nishujangra.github.io/vex/
 repo_url: https://github.com/nishujangra/vex/
 repo_name: vex
-edit_uri: edit/main/docs/
+edit_uri: edit/master/docs/
 
 docs_dir: docs
 site_dir: site

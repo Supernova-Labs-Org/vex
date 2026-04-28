@@ -5,7 +5,7 @@
 Clone the repository and build the project:
 
 ```bash
-git clone https://github.com/yourusername/vex.git
+git clone https://github.com/nishujangra/vex.git
 cd vex
 cargo build --release
 ```
