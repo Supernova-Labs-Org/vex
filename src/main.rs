@@ -58,6 +58,20 @@ struct Cli {
         help = "Number of concurrent in-flight requests per worker"
     )]
     concurrency: usize,
+
+    #[arg(
+        long,
+        default_value = "5000",
+        help = "Per-request response timeout in milliseconds"
+    )]
+    request_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value = "5000",
+        help = "Connection handshake timeout in milliseconds"
+    )]
+    connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,14 +94,10 @@ fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) 
 fn spawn_stream_waiter(
     stream_id: u64,
     rx: oneshot::Receiver<Result<ResponseResult, String>>,
+    request_timeout: Duration,
 ) -> tokio::task::JoinHandle<(u64, PendingOutcome)> {
     tokio::spawn(async move {
-        match tokio::time::timeout(
-            Duration::from_secs(client::constants::network::RESPONSE_TIMEOUT_SECS),
-            rx,
-        )
-        .await
-        {
+        match tokio::time::timeout(request_timeout, rx).await {
             Ok(Ok(result)) => (stream_id, PendingOutcome::Completed(result)),
             Ok(Err(_)) => (
                 stream_id,
@@ -104,10 +114,11 @@ async fn dispatch_with_retry(
     authority: &str,
     path: &str,
     verbose: bool,
+    connect_timeout: Duration,
 ) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), String> {
     for attempt in 1..=MAX_DISPATCH_ATTEMPTS {
         if !h3.is_connected() {
-            h3.ensure_connected(server_name)
+            h3.ensure_connected(server_name, connect_timeout)
                 .await
                 .map_err(|e| format!("reconnect failed: {e}"))?;
         }
@@ -174,6 +185,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Concurrency per worker: {}", cli.concurrency);
     println!("  Total requests: {}", cli.requests);
     println!("  Duration: {}s", cli.duration);
+    println!("  Request timeout: {}ms", cli.request_timeout_ms);
+    println!("  Connect timeout: {}ms", cli.connect_timeout_ms);
     println!("  Insecure: {}", cli.insecure);
     if cli.verbose {
         println!("  Verbose: enabled");
@@ -185,6 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_requests = 0;
     let mut successful_requests = 0;
     let mut failed_requests = 0;
+    let mut timed_out_requests = 0usize;
     let mut total_errors = ErrorStats::default();
     let mut status_code_counts: HashMap<u16, usize> = HashMap::new();
     let mut worker_failures = 0;
@@ -202,11 +216,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let success_status = cli.success_status.clone();
         let requests_per_worker = requests_for_worker(cli.requests, cli.workers, worker_id);
         let concurrency = cli.concurrency;
+        let request_timeout = Duration::from_millis(cli.request_timeout_ms);
+        let connect_timeout = Duration::from_millis(cli.connect_timeout_ms);
         let deadline = Arc::clone(&deadline);
 
         let handle = tokio::spawn(async move {
             let mut success = 0usize;
             let mut fail = 0usize;
+            let mut timed_out = 0usize;
             let mut total_errors = ErrorStats::default();
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
             let mut latencies = Vec::new();
@@ -216,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return (
                     success,
                     fail,
+                    timed_out,
                     total_errors,
                     status_codes,
                     latencies,
@@ -230,6 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return (
                         0,
                         requests_per_worker,
+                        0,
                         ErrorStats::default(),
                         HashMap::new(),
                         Vec::new(),
@@ -238,11 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            if let Err(e) = h3.ensure_connected(&server_name).await {
+            if let Err(e) = h3.ensure_connected(&server_name, connect_timeout).await {
                 eprintln!("Worker {worker_id}: connect failed: {e}");
                 return (
                     0,
                     requests_per_worker,
+                    0,
                     ErrorStats::default(),
                     HashMap::new(),
                     Vec::new(),
@@ -261,11 +281,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && dispatched < requests_per_worker
                 {
                     dispatched += 1;
-                    match dispatch_with_retry(&mut h3, &server_name, &authority, &path, verbose)
-                        .await
+                    match dispatch_with_retry(
+                        &mut h3,
+                        &server_name,
+                        &authority,
+                        &path,
+                        verbose,
+                        connect_timeout,
+                    )
+                    .await
                     {
                         Ok((stream_id, rx)) => {
-                            pending.push(spawn_stream_waiter(stream_id, rx));
+                            pending.push(spawn_stream_waiter(stream_id, rx, request_timeout));
                         }
                         Err(e) => {
                             eprintln!("Worker {worker_id}: {e}");
@@ -296,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match outcome {
                             PendingOutcome::TimedOut => {
                                 h3.abandon_stream(stream_id);
+                                timed_out += 1;
                                 fail += 1;
                             }
                             PendingOutcome::Completed(result) => {
@@ -330,6 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (
                 success,
                 fail,
+                timed_out,
                 total_errors,
                 status_codes,
                 latencies,
@@ -342,10 +371,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (worker_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
-            Ok((s, f, errors, status_codes, latencies, duration_limited)) => {
+            Ok((s, f, t, errors, status_codes, latencies, duration_limited)) => {
                 total_requests += s + f;
                 successful_requests += s;
                 failed_requests += f;
+                timed_out_requests += t;
                 total_errors.send_errors += errors.send_errors;
                 total_errors.recv_errors += errors.recv_errors;
                 total_errors.quic_errors += errors.quic_errors;
@@ -387,6 +417,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Total requests: {}", total_requests);
     println!("  Successful requests: {}", successful_requests);
     println!("  Failed requests: {}", failed_requests);
+    if timed_out_requests > 0 {
+        println!(
+            "  Timed out requests: {} (>{}ms)",
+            timed_out_requests, cli.request_timeout_ms
+        );
+    }
     println!(
         "  Requests/sec: {:.2}",
         if elapsed > 0.0 {

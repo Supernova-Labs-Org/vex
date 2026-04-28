@@ -101,6 +101,7 @@ impl Http3Client {
     pub async fn ensure_connected(
         &mut self,
         server_name: &str,
+        connect_timeout: Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if self.pool.is_usable() {
             return Ok(());
@@ -130,8 +131,7 @@ impl Http3Client {
 
         let mut out = [0u8; constants::network::BUFFER_SIZE];
         let mut buf = [0u8; constants::network::BUFFER_SIZE];
-        let handshake_deadline =
-            Instant::now() + Duration::from_secs(constants::network::HANDSHAKE_TIMEOUT_SECS);
+        let handshake_deadline = Instant::now() + connect_timeout;
         let mut h3_conn: Option<quiche::h3::Connection> = None;
 
         loop {
