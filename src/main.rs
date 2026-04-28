@@ -1,5 +1,4 @@
 use clap::Parser;
-use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,11 +91,12 @@ fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) 
 }
 
 fn spawn_stream_waiter(
+    join_set: &mut tokio::task::JoinSet<(u64, PendingOutcome)>,
     stream_id: u64,
     rx: oneshot::Receiver<Result<ResponseResult, String>>,
     request_timeout: Duration,
-) -> tokio::task::JoinHandle<(u64, PendingOutcome)> {
-    tokio::spawn(async move {
+) {
+    join_set.spawn(async move {
         match tokio::time::timeout(request_timeout, rx).await {
             Ok(Ok(result)) => (stream_id, PendingOutcome::Completed(result)),
             Ok(Err(_)) => (
@@ -105,7 +105,7 @@ fn spawn_stream_waiter(
             ),
             Err(_) => (stream_id, PendingOutcome::TimedOut),
         }
-    })
+    });
 }
 
 async fn dispatch_with_retry(
@@ -271,11 +271,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut dispatched = 0usize;
-            let mut pending: FuturesUnordered<tokio::task::JoinHandle<(u64, PendingOutcome)>> =
-                FuturesUnordered::new();
+            let mut pending: tokio::task::JoinSet<(u64, PendingOutcome)> =
+                tokio::task::JoinSet::new();
+            let deadline_instant = tokio::time::Instant::from_std(*deadline);
 
-            use futures::stream::StreamExt as _;
-            loop {
+            'worker: loop {
                 while pending.len() < concurrency
                     && Instant::now() < *deadline
                     && dispatched < requests_per_worker
@@ -292,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     {
                         Ok((stream_id, rx)) => {
-                            pending.push(spawn_stream_waiter(stream_id, rx, request_timeout));
+                            spawn_stream_waiter(&mut pending, stream_id, rx, request_timeout);
                         }
                         Err(e) => {
                             eprintln!("Worker {worker_id}: {e}");
@@ -309,10 +309,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 tokio::select! {
+                    _ = tokio::time::sleep_until(deadline_instant) => {
+                        // Hard-cancel all in-flight stream waiters so they don't
+                        // continue running detached after the duration deadline.
+                        pending.abort_all();
+                        duration_limited = true;
+                        break 'worker;
+                    }
                     _ = h3.poll_once(), if h3.has_in_flight() => {}
-                    Some(join_result) = pending.next() => {
+                    Some(join_result) = pending.join_next() => {
                         let (stream_id, outcome) = match join_result {
                             Ok(pair) => pair,
+                            Err(e) if e.is_cancelled() => continue,
                             Err(e) => {
                                 eprintln!("Worker {worker_id}: task panicked: {e}");
                                 fail += 1;
@@ -412,6 +420,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CompletionReason::AllRequestsCompleted
     };
 
+    // For throughput, use the configured duration as the denominator when
+    // duration-limited so that in-flight work draining past the deadline
+    // does not deflate the reported req/s.
+    let throughput_window = if hit_duration_limit {
+        cli.duration as f64
+    } else {
+        elapsed
+    };
+
     println!("\nLoad test completed:");
     println!("  Total time: {:.2}s", elapsed);
     println!("  Total requests: {}", total_requests);
@@ -425,8 +442,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "  Requests/sec: {:.2}",
-        if elapsed > 0.0 {
-            total_requests as f64 / elapsed
+        if throughput_window > 0.0 {
+            total_requests as f64 / throughput_window
         } else {
             0.0
         }
@@ -435,8 +452,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match completion_reason {
         CompletionReason::DurationLimitReached => {
             println!(
-                "  Completion reason: Duration limit ({:.0}s) reached",
-                cli.duration
+                "  Completion reason: Duration limit ({:.0}s) reached (actual: {:.2}s)",
+                cli.duration, elapsed
             );
         }
         CompletionReason::AllRequestsCompleted => {
