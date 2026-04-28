@@ -98,12 +98,16 @@ impl Http3Client {
         Ok(config)
     }
 
+    /// Connect if not already connected. Returns the handshake latency in
+    /// milliseconds on a new connection, or `None` if the pool was already
+    /// usable (no handshake was performed).
     pub async fn ensure_connected(
         &mut self,
         server_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+        connect_timeout: Duration,
+    ) -> Result<Option<f64>, Box<dyn std::error::Error>> {
         if self.pool.is_usable() {
-            return Ok(());
+            return Ok(None);
         }
 
         // poll_once drains in_flight before returning false, so by the time
@@ -130,8 +134,8 @@ impl Http3Client {
 
         let mut out = [0u8; constants::network::BUFFER_SIZE];
         let mut buf = [0u8; constants::network::BUFFER_SIZE];
-        let handshake_deadline =
-            Instant::now() + Duration::from_secs(constants::network::HANDSHAKE_TIMEOUT_SECS);
+        let handshake_start = Instant::now();
+        let handshake_deadline = handshake_start + connect_timeout;
         let mut h3_conn: Option<quiche::h3::Connection> = None;
 
         loop {
@@ -193,6 +197,8 @@ impl Http3Client {
             }
         }
 
+        let handshake_ms = handshake_start.elapsed().as_secs_f64() * 1000.0;
+
         self.pool.quic_conn = Some(quic_conn);
         self.pool.h3_conn = h3_conn;
         self.pool.socket = Some(Arc::new(socket));
@@ -200,7 +206,7 @@ impl Http3Client {
         self.pool.peer_addr = Some(peer_addr);
         self.pool.failed = false;
 
-        Ok(())
+        Ok(Some(handshake_ms))
     }
 
     // Dispatch one HTTP/3 stream and return a receiver that resolves when the

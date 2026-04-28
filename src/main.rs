@@ -1,5 +1,4 @@
 use clap::Parser;
-use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,6 +57,23 @@ struct Cli {
         help = "Number of concurrent in-flight requests per worker"
     )]
     concurrency: usize,
+
+    #[arg(
+        long,
+        default_value = "5000",
+        help = "Per-request response timeout in milliseconds"
+    )]
+    request_timeout_ms: u64,
+
+    #[arg(
+        long,
+        default_value = "5000",
+        help = "Connection handshake timeout in milliseconds"
+    )]
+    connect_timeout_ms: u64,
+
+    #[arg(long, default_value = "false", help = "Emit results as JSON to stdout")]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,16 +94,13 @@ fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) 
 }
 
 fn spawn_stream_waiter(
+    join_set: &mut tokio::task::JoinSet<(u64, PendingOutcome)>,
     stream_id: u64,
     rx: oneshot::Receiver<Result<ResponseResult, String>>,
-) -> tokio::task::JoinHandle<(u64, PendingOutcome)> {
-    tokio::spawn(async move {
-        match tokio::time::timeout(
-            Duration::from_secs(client::constants::network::RESPONSE_TIMEOUT_SECS),
-            rx,
-        )
-        .await
-        {
+    request_timeout: Duration,
+) {
+    join_set.spawn(async move {
+        match tokio::time::timeout(request_timeout, rx).await {
             Ok(Ok(result)) => (stream_id, PendingOutcome::Completed(result)),
             Ok(Err(_)) => (
                 stream_id,
@@ -95,25 +108,30 @@ fn spawn_stream_waiter(
             ),
             Err(_) => (stream_id, PendingOutcome::TimedOut),
         }
-    })
+    });
 }
 
+/// Returns the dispatched (stream_id, rx) pair plus any handshake latency
+/// recorded during reconnects (None if no reconnect was needed).
 async fn dispatch_with_retry(
     h3: &mut client::h3_client::Http3Client,
     server_name: &str,
     authority: &str,
     path: &str,
     verbose: bool,
-) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), String> {
+    connect_timeout: Duration,
+) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>, Option<f64>), String> {
+    let mut reconnect_hs_ms: Option<f64> = None;
     for attempt in 1..=MAX_DISPATCH_ATTEMPTS {
         if !h3.is_connected() {
-            h3.ensure_connected(server_name)
-                .await
-                .map_err(|e| format!("reconnect failed: {e}"))?;
+            match h3.ensure_connected(server_name, connect_timeout).await {
+                Ok(hs) => reconnect_hs_ms = hs,
+                Err(e) => return Err(format!("reconnect failed: {e}")),
+            }
         }
 
         match h3.dispatch(authority, path, verbose) {
-            Ok(pair) => return Ok(pair),
+            Ok((sid, rx)) => return Ok((sid, rx, reconnect_hs_ms)),
             Err(err) if err.is_retryable() && attempt < MAX_DISPATCH_ATTEMPTS => {
                 let _ = h3.poll_once().await;
                 tokio::time::sleep(Duration::from_millis(DISPATCH_RETRY_BACKOFF_MS)).await;
@@ -128,6 +146,20 @@ async fn dispatch_with_retry(
     }
 
     Err("dispatch failed unexpectedly".into())
+}
+
+fn print_latency_block(label: &str, sorted: &[f64]) {
+    let min = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    println!("\n{label}:");
+    println!("  Min:  {:.2}", min);
+    println!("  Max:  {:.2}", max);
+    println!("  Avg:  {:.2}", avg);
+    println!("  p50:  {:.2}", percentile(sorted, 50.0));
+    println!("  p90:  {:.2}", percentile(sorted, 90.0));
+    println!("  p95:  {:.2}", percentile(sorted, 95.0));
+    println!("  p99:  {:.2}", percentile(sorted, 99.0));
 }
 
 #[tokio::main]
@@ -174,6 +206,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Concurrency per worker: {}", cli.concurrency);
     println!("  Total requests: {}", cli.requests);
     println!("  Duration: {}s", cli.duration);
+    println!("  Request timeout: {}ms", cli.request_timeout_ms);
+    println!("  Connect timeout: {}ms", cli.connect_timeout_ms);
     println!("  Insecure: {}", cli.insecure);
     if cli.verbose {
         println!("  Verbose: enabled");
@@ -185,10 +219,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut total_requests = 0;
     let mut successful_requests = 0;
     let mut failed_requests = 0;
+    let mut timed_out_requests = 0usize;
     let mut total_errors = ErrorStats::default();
     let mut status_code_counts: HashMap<u16, usize> = HashMap::new();
     let mut worker_failures = 0;
-    let mut all_latencies = Vec::new();
+    let mut success_latencies: Vec<f64> = Vec::new();
+    let mut failure_latencies: Vec<f64> = Vec::new();
+    let mut conn_attempts = 0usize;
+    let mut conn_failures = 0usize;
+    let mut handshake_latencies: Vec<f64> = Vec::new();
+    let mut peak_concurrency = 0usize;
     let mut hit_duration_limit = false;
 
     let mut handles = vec![];
@@ -202,24 +242,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let success_status = cli.success_status.clone();
         let requests_per_worker = requests_for_worker(cli.requests, cli.workers, worker_id);
         let concurrency = cli.concurrency;
+        let request_timeout = Duration::from_millis(cli.request_timeout_ms);
+        let connect_timeout = Duration::from_millis(cli.connect_timeout_ms);
         let deadline = Arc::clone(&deadline);
 
         let handle = tokio::spawn(async move {
             let mut success = 0usize;
             let mut fail = 0usize;
+            let mut timed_out = 0usize;
             let mut total_errors = ErrorStats::default();
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
-            let mut latencies = Vec::new();
+            let mut success_lats: Vec<f64> = Vec::new();
+            let mut failure_lats: Vec<f64> = Vec::new();
+            let mut conn_attempts = 0usize;
+            let mut conn_failures = 0usize;
+            let mut handshake_lats: Vec<f64> = Vec::new();
+            let mut peak_concurrency = 0usize;
             let mut duration_limited = false;
+
+            macro_rules! empty_return {
+                ($fail:expr) => {
+                    return (
+                        0, $fail, 0,
+                        ErrorStats::default(), HashMap::new(),
+                        Vec::new(), Vec::new(),
+                        conn_attempts, conn_failures, handshake_lats,
+                        0usize, false,
+                    )
+                };
+            }
 
             if requests_per_worker == 0 {
                 return (
-                    success,
-                    fail,
-                    total_errors,
-                    status_codes,
-                    latencies,
-                    duration_limited,
+                    success, fail, timed_out, total_errors, status_codes,
+                    success_lats, failure_lats,
+                    conn_attempts, conn_failures, handshake_lats,
+                    peak_concurrency, duration_limited,
                 );
             }
 
@@ -227,48 +285,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Worker {worker_id}: init failed: {e}");
-                    return (
-                        0,
-                        requests_per_worker,
-                        ErrorStats::default(),
-                        HashMap::new(),
-                        Vec::new(),
-                        false,
-                    );
+                    empty_return!(requests_per_worker);
                 }
             };
 
-            if let Err(e) = h3.ensure_connected(&server_name).await {
-                eprintln!("Worker {worker_id}: connect failed: {e}");
-                return (
-                    0,
-                    requests_per_worker,
-                    ErrorStats::default(),
-                    HashMap::new(),
-                    Vec::new(),
-                    false,
-                );
+            conn_attempts += 1;
+            match h3.ensure_connected(&server_name, connect_timeout).await {
+                Ok(Some(ms)) => handshake_lats.push(ms),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("Worker {worker_id}: connect failed: {e}");
+                    conn_failures += 1;
+                    empty_return!(requests_per_worker);
+                }
             }
 
             let mut dispatched = 0usize;
-            let mut pending: FuturesUnordered<tokio::task::JoinHandle<(u64, PendingOutcome)>> =
-                FuturesUnordered::new();
+            let mut pending: tokio::task::JoinSet<(u64, PendingOutcome)> =
+                tokio::task::JoinSet::new();
+            let deadline_instant = tokio::time::Instant::from_std(*deadline);
 
-            use futures::stream::StreamExt as _;
-            loop {
+            'worker: loop {
                 while pending.len() < concurrency
                     && Instant::now() < *deadline
                     && dispatched < requests_per_worker
                 {
                     dispatched += 1;
-                    match dispatch_with_retry(&mut h3, &server_name, &authority, &path, verbose)
-                        .await
+                    match dispatch_with_retry(
+                        &mut h3,
+                        &server_name,
+                        &authority,
+                        &path,
+                        verbose,
+                        connect_timeout,
+                    )
+                    .await
                     {
-                        Ok((stream_id, rx)) => {
-                            pending.push(spawn_stream_waiter(stream_id, rx));
+                        Ok((stream_id, rx, hs_ms)) => {
+                            if let Some(ms) = hs_ms {
+                                conn_attempts += 1;
+                                handshake_lats.push(ms);
+                            }
+                            spawn_stream_waiter(&mut pending, stream_id, rx, request_timeout);
+                            let c = pending.len();
+                            if c > peak_concurrency {
+                                peak_concurrency = c;
+                            }
                         }
                         Err(e) => {
                             eprintln!("Worker {worker_id}: {e}");
+                            if e.contains("reconnect failed") {
+                                conn_attempts += 1;
+                                conn_failures += 1;
+                            }
                             fail += 1;
                         }
                     }
@@ -282,10 +351,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 tokio::select! {
+                    _ = tokio::time::sleep_until(deadline_instant) => {
+                        // Hard-cancel all in-flight stream waiters so they don't
+                        // continue running detached after the duration deadline.
+                        pending.abort_all();
+                        duration_limited = true;
+                        break 'worker;
+                    }
                     _ = h3.poll_once(), if h3.has_in_flight() => {}
-                    Some(join_result) = pending.next() => {
+                    Some(join_result) = pending.join_next() => {
                         let (stream_id, outcome) = match join_result {
                             Ok(pair) => pair,
+                            Err(e) if e.is_cancelled() => continue,
                             Err(e) => {
                                 eprintln!("Worker {worker_id}: task panicked: {e}");
                                 fail += 1;
@@ -296,22 +373,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match outcome {
                             PendingOutcome::TimedOut => {
                                 h3.abandon_stream(stream_id);
+                                timed_out += 1;
                                 fail += 1;
+                                failure_lats.push(request_timeout.as_secs_f64() * 1000.0);
                             }
                             PendingOutcome::Completed(result) => {
                                 match result {
                                     Ok(r) => {
                                         *status_codes.entry(r.status_code).or_insert(0) += 1;
-                                        if is_success_status(r.status_code, &success_status) {
-                                            success += 1;
-                                        } else {
-                                            fail += 1;
-                                        }
                                         total_errors.send_errors += r.errors.send_errors;
                                         total_errors.recv_errors += r.errors.recv_errors;
                                         total_errors.quic_errors += r.errors.quic_errors;
                                         total_errors.stream_reset_errors += r.errors.stream_reset_errors;
-                                        latencies.push(r.latency_ms);
+                                        if is_success_status(r.status_code, &success_status) {
+                                            success += 1;
+                                            success_lats.push(r.latency_ms);
+                                        } else {
+                                            fail += 1;
+                                            failure_lats.push(r.latency_ms);
+                                        }
                                     }
                                     Err(ref e) if e.contains("connection replaced") => {
                                         dispatched = dispatched.saturating_sub(1);
@@ -328,12 +408,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             (
-                success,
-                fail,
-                total_errors,
-                status_codes,
-                latencies,
-                duration_limited,
+                success, fail, timed_out, total_errors, status_codes,
+                success_lats, failure_lats,
+                conn_attempts, conn_failures, handshake_lats,
+                peak_concurrency, duration_limited,
             )
         });
 
@@ -342,21 +420,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (worker_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
-            Ok((s, f, errors, status_codes, latencies, duration_limited)) => {
+            Ok((s, f, t, errors, status_codes, s_lats, f_lats, ca, cf, hs_lats, peak, duration_limited)) => {
                 total_requests += s + f;
                 successful_requests += s;
                 failed_requests += f;
+                timed_out_requests += t;
                 total_errors.send_errors += errors.send_errors;
                 total_errors.recv_errors += errors.recv_errors;
                 total_errors.quic_errors += errors.quic_errors;
                 total_errors.stream_reset_errors += errors.stream_reset_errors;
                 hit_duration_limit |= duration_limited;
+                conn_attempts += ca;
+                conn_failures += cf;
+                handshake_latencies.extend(hs_lats);
+                if peak > peak_concurrency {
+                    peak_concurrency = peak;
+                }
 
                 for (code, count) in status_codes {
                     *status_code_counts.entry(code).or_insert(0) += count;
                 }
 
-                all_latencies.extend(latencies);
+                success_latencies.extend(s_lats);
+                failure_latencies.extend(f_lats);
             }
             Err(join_err) => {
                 worker_failures += 1;
@@ -382,25 +468,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CompletionReason::AllRequestsCompleted
     };
 
+    let duration_window = cli.duration as f64;
+
     println!("\nLoad test completed:");
     println!("  Total time: {:.2}s", elapsed);
     println!("  Total requests: {}", total_requests);
     println!("  Successful requests: {}", successful_requests);
     println!("  Failed requests: {}", failed_requests);
-    println!(
-        "  Requests/sec: {:.2}",
-        if elapsed > 0.0 {
-            total_requests as f64 / elapsed
-        } else {
-            0.0
-        }
-    );
+    if timed_out_requests > 0 {
+        println!(
+            "  Timed out requests: {} (>{}ms)",
+            timed_out_requests, cli.request_timeout_ms
+        );
+    }
+    if hit_duration_limit {
+        // In-duration: requests completed ÷ configured window (excludes post-deadline tail).
+        // End-to-end: requests completed ÷ actual wall-clock time (includes post-deadline tail).
+        println!(
+            "  Req/s (in-duration):  {:.2}",
+            if duration_window > 0.0 { total_requests as f64 / duration_window } else { 0.0 }
+        );
+        println!(
+            "  Req/s (end-to-end):   {:.2}",
+            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
+        );
+    } else {
+        println!(
+            "  Requests/sec: {:.2}",
+            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
+        );
+    }
 
     match completion_reason {
         CompletionReason::DurationLimitReached => {
             println!(
-                "  Completion reason: Duration limit ({:.0}s) reached",
-                cli.duration
+                "  Completion reason: Duration limit ({:.0}s) reached (actual: {:.2}s)",
+                cli.duration, elapsed
             );
         }
         CompletionReason::AllRequestsCompleted => {
@@ -452,27 +555,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !all_latencies.is_empty() {
-        println!("\nLatency metrics (ms):");
+    success_latencies.sort_by(|a, b| a.total_cmp(b));
+    failure_latencies.sort_by(|a, b| a.total_cmp(b));
+    handshake_latencies.sort_by(|a, b| a.total_cmp(b));
 
-        let mut sorted_latencies = all_latencies;
-        sorted_latencies.sort_by(|a, b| a.total_cmp(b));
+    let rps_in_duration = if duration_window > 0.0 { total_requests as f64 / duration_window } else { 0.0 };
+    let rps_end_to_end  = if elapsed > 0.0           { total_requests as f64 / elapsed }          else { 0.0 };
 
-        let min = sorted_latencies[0];
-        let max = sorted_latencies[sorted_latencies.len() - 1];
-        let avg = sorted_latencies.iter().sum::<f64>() / sorted_latencies.len() as f64;
-        let p50 = percentile(&sorted_latencies, 50.0);
-        let p90 = percentile(&sorted_latencies, 90.0);
-        let p95 = percentile(&sorted_latencies, 95.0);
-        let p99 = percentile(&sorted_latencies, 99.0);
+    if cli.json {
+        print_json(
+            &cli, elapsed, total_requests, successful_requests, failed_requests,
+            timed_out_requests, rps_in_duration, rps_end_to_end, hit_duration_limit,
+            &total_errors, &status_code_counts,
+            &success_latencies, &failure_latencies,
+            conn_attempts, conn_failures, &handshake_latencies, peak_concurrency,
+        );
+    } else {
+        if !success_latencies.is_empty() {
+            print_latency_block("Latency (successful requests, ms)", &success_latencies);
+        }
+        if !failure_latencies.is_empty() {
+            print_latency_block("Latency (failed requests, ms)", &failure_latencies);
+        }
 
-        println!("  Min:  {:.2}", min);
-        println!("  Max:  {:.2}", max);
-        println!("  Avg:  {:.2}", avg);
-        println!("  p50:  {:.2}", p50);
-        println!("  p90:  {:.2}", p90);
-        println!("  p95:  {:.2}", p95);
-        println!("  p99:  {:.2}", p99);
+        println!("\nConnection diagnostics:");
+        println!("  Connection attempts:  {}", conn_attempts);
+        println!("  Connection failures:  {}", conn_failures);
+        println!("  Peak stream concurrency: {}", peak_concurrency);
+        if !handshake_latencies.is_empty() {
+            print_latency_block("Handshake latency (ms)", &handshake_latencies);
+        }
     }
 
     if worker_failures > 0 {
@@ -499,6 +611,109 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_json(
+    cli: &Cli,
+    elapsed: f64,
+    total_requests: usize,
+    successful_requests: usize,
+    failed_requests: usize,
+    timed_out_requests: usize,
+    rps_in_duration: f64,
+    rps_end_to_end: f64,
+    hit_duration_limit: bool,
+    errors: &ErrorStats,
+    status_codes: &HashMap<u16, usize>,
+    success_lats: &[f64],
+    failure_lats: &[f64],
+    conn_attempts: usize,
+    conn_failures: usize,
+    handshake_lats: &[f64],
+    peak_concurrency: usize,
+) {
+    let lat_obj = |lats: &[f64]| -> String {
+        if lats.is_empty() {
+            return "null".into();
+        }
+        let min = lats[0];
+        let max = lats[lats.len() - 1];
+        let avg = lats.iter().sum::<f64>() / lats.len() as f64;
+        format!(
+            "{{\"min\":{min:.3},\"max\":{max:.3},\"avg\":{avg:.3},\
+             \"p50\":{p50:.3},\"p90\":{p90:.3},\"p95\":{p95:.3},\"p99\":{p99:.3}}}",
+            p50 = percentile(lats, 50.0),
+            p90 = percentile(lats, 90.0),
+            p95 = percentile(lats, 95.0),
+            p99 = percentile(lats, 99.0),
+        )
+    };
+
+    let status_entries: Vec<String> = {
+        let mut sorted: Vec<_> = status_codes.iter().collect();
+        sorted.sort_by_key(|&(k, _)| k);
+        sorted.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect()
+    };
+
+    println!(
+        concat!(
+            "{{\n",
+            "  \"target\": \"{target}\",\n",
+            "  \"workers\": {workers},\n",
+            "  \"concurrency\": {concurrency},\n",
+            "  \"total_time_s\": {elapsed:.3},\n",
+            "  \"duration_limited\": {dur_lim},\n",
+            "  \"requests\": {{\n",
+            "    \"total\": {total},\n",
+            "    \"successful\": {succ},\n",
+            "    \"failed\": {fail},\n",
+            "    \"timed_out\": {timed_out}\n",
+            "  }},\n",
+            "  \"throughput\": {{\n",
+            "    \"rps_in_duration\": {rps_in:.3},\n",
+            "    \"rps_end_to_end\": {rps_e2e:.3}\n",
+            "  }},\n",
+            "  \"errors\": {{\n",
+            "    \"send\": {send_err},\n",
+            "    \"recv\": {recv_err},\n",
+            "    \"quic\": {quic_err},\n",
+            "    \"stream_reset\": {reset_err}\n",
+            "  }},\n",
+            "  \"status_codes\": {{{status}}},\n",
+            "  \"latency_success_ms\": {lat_succ},\n",
+            "  \"latency_failure_ms\": {lat_fail},\n",
+            "  \"connections\": {{\n",
+            "    \"attempts\": {conn_att},\n",
+            "    \"failures\": {conn_fail},\n",
+            "    \"peak_stream_concurrency\": {peak},\n",
+            "    \"handshake_latency_ms\": {lat_hs}\n",
+            "  }}\n",
+            "}}"
+        ),
+        target      = cli.target,
+        workers     = cli.workers,
+        concurrency = cli.concurrency,
+        elapsed     = elapsed,
+        dur_lim     = hit_duration_limit,
+        total       = total_requests,
+        succ        = successful_requests,
+        fail        = failed_requests,
+        timed_out   = timed_out_requests,
+        rps_in      = rps_in_duration,
+        rps_e2e     = rps_end_to_end,
+        send_err    = errors.send_errors,
+        recv_err    = errors.recv_errors,
+        quic_err    = errors.quic_errors,
+        reset_err   = errors.stream_reset_errors,
+        status      = status_entries.join(","),
+        lat_succ    = lat_obj(success_lats),
+        lat_fail    = lat_obj(failure_lats),
+        conn_att    = conn_attempts,
+        conn_fail   = conn_failures,
+        peak        = peak_concurrency,
+        lat_hs      = lat_obj(handshake_lats),
+    );
 }
 
 #[cfg(test)]
