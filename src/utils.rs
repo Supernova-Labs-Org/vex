@@ -82,6 +82,18 @@ pub fn resolve_target(target: &str, port: u16) -> Result<SocketAddr, Box<dyn std
         .ok_or_else(|| format!("Could not resolve host: {}", target).into())
 }
 
+/// Convert parsed host form into a TLS SNI server name.
+///
+/// For bracketed IPv6 hosts (e.g. `[::1]`) this returns the unbracketed
+/// form (`::1`). Other hosts are returned unchanged.
+pub fn sni_server_name(host: &str) -> &str {
+    if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    }
+}
+
 /// Compute percentile from sorted values using linear interpolation
 ///
 /// # Arguments
@@ -149,6 +161,34 @@ pub fn is_success_status(status_code: u16, success_pattern: &str) -> bool {
         }
     }
     false
+}
+
+/// Validate --success-status input before running the load test.
+pub fn validate_success_pattern(success_pattern: &str) -> Result<(), String> {
+    if success_pattern.trim().is_empty() {
+        return Err("pattern must not be empty".into());
+    }
+
+    for part in success_pattern.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            return Err("empty token in pattern".into());
+        }
+
+        match token {
+            "2xx" | "3xx" | "4xx" | "5xx" => continue,
+            _ => {
+                let code = token
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid token '{token}'"))?;
+                if !(100..=599).contains(&code) {
+                    return Err(format!("status code out of range: {code}"));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,5 +273,36 @@ mod tests {
     #[test]
     fn test_malformed_ipv6() {
         assert!(parse_target("[::1:8443", 443).is_err());
+    }
+
+    #[test]
+    fn test_sni_name_unbrackets_ipv6() {
+        assert_eq!(sni_server_name("[::1]"), "::1");
+        assert_eq!(sni_server_name("[2001:db8::10]"), "2001:db8::10");
+    }
+
+    #[test]
+    fn test_sni_name_keeps_hostname() {
+        assert_eq!(sni_server_name("example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_validate_success_pattern_accepts_mixed_values() {
+        assert!(validate_success_pattern("2xx,3xx,200,418").is_ok());
+    }
+
+    #[test]
+    fn test_validate_success_pattern_rejects_empty_token() {
+        assert!(validate_success_pattern("2xx,,3xx").is_err());
+    }
+
+    #[test]
+    fn test_validate_success_pattern_rejects_invalid_token() {
+        assert!(validate_success_pattern("2xy").is_err());
+    }
+
+    #[test]
+    fn test_validate_success_pattern_rejects_out_of_range_code() {
+        assert!(validate_success_pattern("700").is_err());
     }
 }

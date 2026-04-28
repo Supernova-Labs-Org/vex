@@ -1,14 +1,21 @@
 use clap::Parser;
-use std::sync::Arc;
-use std::time::{Instant, Duration};
-use std::collections::HashMap;
 use futures::stream::FuturesUnordered;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 pub mod client;
 pub mod utils;
 
-use client::ErrorStats;
-use utils::{percentile, is_success_status, parse_target, resolve_target};
+use client::{ErrorStats, ResponseResult};
+use utils::{
+    is_success_status, parse_target, percentile, resolve_target, sni_server_name,
+    validate_success_pattern,
+};
+
+const MAX_DISPATCH_ATTEMPTS: usize = 5;
+const DISPATCH_RETRY_BACKOFF_MS: u64 = 5;
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -37,11 +44,90 @@ struct Cli {
     #[arg(long, default_value = "false")]
     verbose: bool,
 
-    #[arg(long, default_value = "2xx", help = "HTTP status codes to consider as success (e.g., '2xx', '2xx,3xx', or specific codes '200,201,301')")]
+    #[arg(
+        long,
+        default_value = "2xx",
+        help = "HTTP status codes to consider as success (e.g., '2xx', '2xx,3xx', or specific codes '200,201,301')"
+    )]
     success_status: String,
 
-    #[arg(short = 'c', long, default_value = "1", help = "Number of concurrent in-flight requests per worker")]
+    #[arg(
+        short = 'c',
+        long,
+        default_value = "1",
+        help = "Number of concurrent in-flight requests per worker"
+    )]
     concurrency: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionReason {
+    AllRequestsCompleted,
+    DurationLimitReached,
+}
+
+enum PendingOutcome {
+    Completed(Result<ResponseResult, String>),
+    TimedOut,
+}
+
+fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) -> usize {
+    let quotient = total_requests / workers;
+    let remainder = total_requests % workers;
+    quotient + if worker_id < remainder { 1 } else { 0 }
+}
+
+fn spawn_stream_waiter(
+    stream_id: u64,
+    rx: oneshot::Receiver<Result<ResponseResult, String>>,
+) -> tokio::task::JoinHandle<(u64, PendingOutcome)> {
+    tokio::spawn(async move {
+        match tokio::time::timeout(
+            Duration::from_secs(client::constants::network::RESPONSE_TIMEOUT_SECS),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(result)) => (stream_id, PendingOutcome::Completed(result)),
+            Ok(Err(_)) => (
+                stream_id,
+                PendingOutcome::Completed(Err("channel closed".into())),
+            ),
+            Err(_) => (stream_id, PendingOutcome::TimedOut),
+        }
+    })
+}
+
+async fn dispatch_with_retry(
+    h3: &mut client::h3_client::Http3Client,
+    server_name: &str,
+    authority: &str,
+    path: &str,
+    verbose: bool,
+) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), String> {
+    for attempt in 1..=MAX_DISPATCH_ATTEMPTS {
+        if !h3.is_connected() {
+            h3.ensure_connected(server_name)
+                .await
+                .map_err(|e| format!("reconnect failed: {e}"))?;
+        }
+
+        match h3.dispatch(authority, path, verbose) {
+            Ok(pair) => return Ok(pair),
+            Err(err) if err.is_retryable() && attempt < MAX_DISPATCH_ATTEMPTS => {
+                let _ = h3.poll_once().await;
+                tokio::time::sleep(Duration::from_millis(DISPATCH_RETRY_BACKOFF_MS)).await;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "dispatch failed after {} attempts: {}",
+                    attempt, err
+                ));
+            }
+        }
+    }
+
+    Err("dispatch failed unexpectedly".into())
 }
 
 #[tokio::main]
@@ -53,22 +139,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Parse target into bare hostname and effective port.
-    // server_name is used for SNI (must be host-only, no port).
-    // authority is used for the HTTP/3 :authority header (host:port when non-default).
-    // peer_addr is resolved once here and shared across all workers/slots.
-    let (server_name, effective_port) = parse_target(&cli.target, cli.port)?;
-    let authority = if effective_port == 443 {
-        server_name.clone()
-    } else {
-        format!("{}:{}", server_name, effective_port)
-    };
-    let peer_addr = resolve_target(&cli.target, cli.port)?;
-
     if cli.concurrency == 0 {
         eprintln!("concurrency must be at least 1");
         std::process::exit(1);
     }
+
+    if !cli.path.starts_with('/') {
+        eprintln!("path must start with '/' (got: {})", cli.path);
+        std::process::exit(1);
+    }
+
+    if let Err(err) = validate_success_pattern(&cli.success_status) {
+        eprintln!("invalid --success-status pattern: {}", err);
+        std::process::exit(1);
+    }
+
+    // Parse target into host and effective port.
+    // host_for_authority is used for the HTTP/3 :authority header.
+    // server_name is used for TLS SNI and must be bracket-free for IPv6.
+    let (host_for_authority, effective_port) = parse_target(&cli.target, cli.port)?;
+    let server_name = sni_server_name(&host_for_authority).to_string();
+    let authority = if effective_port == 443 {
+        host_for_authority.clone()
+    } else {
+        format!("{}:{}", host_for_authority, effective_port)
+    };
+    let peer_addr = resolve_target(&cli.target, cli.port)?;
 
     println!("Starting HTTP/3 load test:");
     println!("  Target: {}:{}", cli.target, effective_port);
@@ -85,8 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     let start_time = Instant::now();
-    let deadline = start_time + Duration::from_secs(cli.duration);
-    let deadline = Arc::new(deadline);
+    let deadline = Arc::new(start_time + Duration::from_secs(cli.duration));
     let mut total_requests = 0;
     let mut successful_requests = 0;
     let mut failed_requests = 0;
@@ -94,12 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut status_code_counts: HashMap<u16, usize> = HashMap::new();
     let mut worker_failures = 0;
     let mut all_latencies = Vec::new();
+    let mut hit_duration_limit = false;
 
     let mut handles = vec![];
-
-    // Distribute requests: quotient to all workers, remainder to first N workers
-    let quotient = cli.requests / cli.workers;
-    let remainder = cli.requests % cli.workers;
 
     for worker_id in 0..cli.workers {
         let server_name = server_name.clone();
@@ -108,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let insecure = cli.insecure;
         let verbose = cli.verbose;
         let success_status = cli.success_status.clone();
-        let requests_per_worker = quotient + if worker_id < remainder { 1 } else { 0 };
+        let requests_per_worker = requests_for_worker(cli.requests, cli.workers, worker_id);
         let concurrency = cli.concurrency;
         let deadline = Arc::clone(&deadline);
 
@@ -118,75 +210,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut total_errors = ErrorStats::default();
             let mut status_codes: HashMap<u16, usize> = HashMap::new();
             let mut latencies = Vec::new();
+            let mut duration_limited = false;
 
-            // One Http3Client per worker: all concurrent streams share one QUIC
-            // connection. On connection failure we reconnect and keep going.
+            if requests_per_worker == 0 {
+                return (
+                    success,
+                    fail,
+                    total_errors,
+                    status_codes,
+                    latencies,
+                    duration_limited,
+                );
+            }
+
             let mut h3 = match client::h3_client::Http3Client::new(insecure, peer_addr) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Worker {worker_id}: init failed: {e}");
-                    return (0, 1, ErrorStats::default(), HashMap::new(), Vec::new());
+                    return (
+                        0,
+                        requests_per_worker,
+                        ErrorStats::default(),
+                        HashMap::new(),
+                        Vec::new(),
+                        false,
+                    );
                 }
             };
 
-            // Establish the connection before dispatching any streams.
             if let Err(e) = h3.ensure_connected(&server_name).await {
                 eprintln!("Worker {worker_id}: connect failed: {e}");
-                return (0, 1, ErrorStats::default(), HashMap::new(), Vec::new());
+                return (
+                    0,
+                    requests_per_worker,
+                    ErrorStats::default(),
+                    HashMap::new(),
+                    Vec::new(),
+                    false,
+                );
             }
 
-            let mut dispatched: usize = 0;
-
-            // Receivers for the currently in-flight streams.
-            // We use FuturesUnordered to await them concurrently while also
-            // driving the shared poll loop.
+            let mut dispatched = 0usize;
             let mut pending: FuturesUnordered<
-                tokio::task::JoinHandle<(bool, Result<client::ResponseResult, String>)>
+                tokio::task::JoinHandle<(u64, PendingOutcome)>,
             > = FuturesUnordered::new();
 
-            // Seed up to `concurrency` streams.
-            for _ in 0..concurrency {
-                if Instant::now() >= *deadline || dispatched >= requests_per_worker { break; }
-                dispatched += 1;
-
-                match h3.dispatch(&authority, &path, verbose) {
-                    Ok((_sid, rx)) => {
-                        let success_status = success_status.clone();
-                        pending.push(tokio::spawn(async move {
-                            let result = rx.await
-                                .unwrap_or_else(|_| Err("channel closed".into()));
-                            let ok = result.as_ref()
-                                .map(|r| is_success_status(r.status_code, &success_status))
-                                .unwrap_or(false);
-                            (ok, result)
-                        }));
-                    }
-                    Err(e) => {
-                        eprintln!("Worker {worker_id}: dispatch failed: {e}");
-                        fail += 1;
-                    }
-                }
-            }
-
-            // Drive the connection and collect results. We select between the
-            // QUIC poll loop and the first completed receiver so neither starves
-            // the other. poll_once() has an internal timeout so it yields
-            // promptly even when no packets arrive.
             use futures::stream::StreamExt as _;
             loop {
+                while pending.len() < concurrency
+                    && Instant::now() < *deadline
+                    && dispatched < requests_per_worker
+                {
+                    dispatched += 1;
+                    match dispatch_with_retry(
+                        &mut h3,
+                        &server_name,
+                        &authority,
+                        &path,
+                        verbose,
+                    )
+                    .await
+                    {
+                        Ok((stream_id, rx)) => {
+                            pending.push(spawn_stream_waiter(stream_id, rx));
+                        }
+                        Err(e) => {
+                            eprintln!("Worker {worker_id}: {e}");
+                            fail += 1;
+                        }
+                    }
+                }
+
                 if pending.is_empty() {
+                    if dispatched < requests_per_worker && Instant::now() >= *deadline {
+                        duration_limited = true;
+                    }
                     break;
                 }
 
                 tokio::select! {
-                    // Drive QUIC I/O and H3 event dispatch.
-                    // When the connection dies, poll_once drains any in-flight
-                    // streams with a "connection replaced" error so their tasks
-                    // complete and flow through pending.next() below.
-                    _alive = h3.poll_once(), if h3.has_in_flight() => {}
-                    // A stream receiver resolved.
+                    _ = h3.poll_once(), if h3.has_in_flight() => {}
                     Some(join_result) = pending.next() => {
-                        let (ok, result) = match join_result {
+                        let (stream_id, outcome) = match join_result {
                             Ok(pair) => pair,
                             Err(e) => {
                                 eprintln!("Worker {worker_id}: task panicked: {e}");
@@ -194,52 +299,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
-                        match result {
-                            Ok(r) => {
-                                *status_codes.entry(r.status_code).or_insert(0) += 1;
-                                if ok { success += 1; } else { fail += 1; }
-                                total_errors.send_errors += r.errors.send_errors;
-                                total_errors.recv_errors += r.errors.recv_errors;
-                                total_errors.quic_errors += r.errors.quic_errors;
-                                total_errors.stream_reset_errors += r.errors.stream_reset_errors;
-                                latencies.push(r.latency_ms);
-                            }
-                            Err(ref e) if e.contains("connection replaced") => {
-                                // Stream was killed when the connection closed mid-flight.
-                                // Undo the dispatch count so the backfill below re-queues it.
-                                dispatched = dispatched.saturating_sub(1);
-                            }
-                            Err(e) => {
-                                eprintln!("Worker {worker_id}: request failed: {e}");
+
+                        match outcome {
+                            PendingOutcome::TimedOut => {
+                                h3.abandon_stream(stream_id);
                                 fail += 1;
                             }
-                        }
-
-                        // Backfill: keep concurrency slots full.
-                        if Instant::now() < *deadline && dispatched < requests_per_worker {
-                            dispatched += 1;
-                            if !h3.is_connected() {
-                                if let Err(e) = h3.ensure_connected(&server_name).await {
-                                    eprintln!("Worker {worker_id}: reconnect failed: {e}");
-                                    fail += 1;
-                                    continue;
-                                }
-                            }
-                            match h3.dispatch(&authority, &path, verbose) {
-                                Ok((_sid, rx)) => {
-                                    let success_status = success_status.clone();
-                                    pending.push(tokio::spawn(async move {
-                                        let result = rx.await
-                                            .unwrap_or_else(|_| Err("channel closed".into()));
-                                        let ok = result.as_ref()
-                                            .map(|r| is_success_status(r.status_code, &success_status))
-                                            .unwrap_or(false);
-                                        (ok, result)
-                                    }));
-                                }
-                                Err(e) => {
-                                    eprintln!("Worker {worker_id}: dispatch failed: {e}");
-                                    fail += 1;
+                            PendingOutcome::Completed(result) => {
+                                match result {
+                                    Ok(r) => {
+                                        *status_codes.entry(r.status_code).or_insert(0) += 1;
+                                        if is_success_status(r.status_code, &success_status) {
+                                            success += 1;
+                                        } else {
+                                            fail += 1;
+                                        }
+                                        total_errors.send_errors += r.errors.send_errors;
+                                        total_errors.recv_errors += r.errors.recv_errors;
+                                        total_errors.quic_errors += r.errors.quic_errors;
+                                        total_errors.stream_reset_errors += r.errors.stream_reset_errors;
+                                        latencies.push(r.latency_ms);
+                                    }
+                                    Err(ref e) if e.contains("connection replaced") => {
+                                        dispatched = dispatched.saturating_sub(1);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Worker {worker_id}: request failed: {e}");
+                                        fail += 1;
+                                    }
                                 }
                             }
                         }
@@ -247,7 +334,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            (success, fail, total_errors, status_codes, latencies)
+            (
+                success,
+                fail,
+                total_errors,
+                status_codes,
+                latencies,
+                duration_limited,
+            )
         });
 
         handles.push(handle);
@@ -255,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (worker_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
-            Ok((s, f, errors, status_codes, latencies)) => {
+            Ok((s, f, errors, status_codes, latencies, duration_limited)) => {
                 total_requests += s + f;
                 successful_requests += s;
                 failed_requests += f;
@@ -263,13 +357,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 total_errors.recv_errors += errors.recv_errors;
                 total_errors.quic_errors += errors.quic_errors;
                 total_errors.stream_reset_errors += errors.stream_reset_errors;
+                hit_duration_limit |= duration_limited;
 
-                // Aggregate status code counts
                 for (code, count) in status_codes {
                     *status_code_counts.entry(code).or_insert(0) += count;
                 }
 
-                // Aggregate latencies
                 all_latencies.extend(latencies);
             }
             Err(join_err) => {
@@ -286,22 +379,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
-    let hit_duration_limit = Instant::now() >= *deadline;
+    if total_requests < cli.requests {
+        hit_duration_limit = true;
+    }
+
+    let completion_reason = if hit_duration_limit {
+        CompletionReason::DurationLimitReached
+    } else {
+        CompletionReason::AllRequestsCompleted
+    };
 
     println!("\nLoad test completed:");
     println!("  Total time: {:.2}s", elapsed);
     println!("  Total requests: {}", total_requests);
     println!("  Successful requests: {}", successful_requests);
     println!("  Failed requests: {}", failed_requests);
-    println!("  Requests/sec: {:.2}", if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 });
+    println!(
+        "  Requests/sec: {:.2}",
+        if elapsed > 0.0 {
+            total_requests as f64 / elapsed
+        } else {
+            0.0
+        }
+    );
 
-    if hit_duration_limit {
-        println!("  Completion reason: Duration limit ({:.0}s) reached", cli.duration);
-    } else {
-        println!("  Completion reason: All {} requests completed", cli.requests);
+    match completion_reason {
+        CompletionReason::DurationLimitReached => {
+            println!(
+                "  Completion reason: Duration limit ({:.0}s) reached",
+                cli.duration
+            );
+        }
+        CompletionReason::AllRequestsCompleted => {
+            println!(
+                "  Completion reason: All {} requests completed",
+                cli.requests
+            );
+        }
     }
 
-    // Report error breakdown
     let has_errors = total_errors.send_errors > 0
         || total_errors.recv_errors > 0
         || total_errors.quic_errors > 0
@@ -323,7 +439,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Report HTTP status code breakdown
     if !status_code_counts.is_empty() {
         println!("\nHTTP Status code breakdown:");
         let mut sorted_codes: Vec<_> = status_code_counts.iter().collect();
@@ -341,12 +456,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Report latency metrics
     if !all_latencies.is_empty() {
         println!("\nLatency metrics (ms):");
 
-        let mut sorted_latencies = all_latencies.clone();
-        sorted_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut sorted_latencies = all_latencies;
+        sorted_latencies.sort_by(|a, b| a.total_cmp(b));
 
         let min = sorted_latencies[0];
         let max = sorted_latencies[sorted_latencies.len() - 1];
@@ -365,34 +479,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  p99:  {:.2}", p99);
     }
 
-    // Report worker failures
     if worker_failures > 0 {
-        eprintln!(
-            "\nWarning: {} worker(s) failed or panicked",
-            worker_failures
-        );
+        eprintln!("\nWarning: {} worker(s) failed or panicked", worker_failures);
         eprintln!(
             "This may indicate system instability or resource exhaustion during the load test."
         );
-        return Err(format!(
-            "{} worker failure(s) detected",
-            worker_failures
-        )
-        .into());
+        return Err(format!("{} worker failure(s) detected", worker_failures).into());
     }
 
-    // Verify that all requested requests were sent (only if we didn't hit duration limit)
     if !hit_duration_limit && total_requests != cli.requests {
         eprintln!(
             "Warning: Request count mismatch! Expected {}, but sent {}",
             cli.requests, total_requests
         );
-        return Err(format!(
-            "Request count mismatch: expected {} but sent {}",
-            cli.requests, total_requests
-        )
-        .into());
+        return Err(
+            format!(
+                "Request count mismatch: expected {} but sent {}",
+                cli.requests, total_requests
+            )
+            .into(),
+        );
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requests_for_worker;
+
+    #[test]
+    fn distributes_requests_evenly_across_workers() {
+        assert_eq!(requests_for_worker(10, 3, 0), 4);
+        assert_eq!(requests_for_worker(10, 3, 1), 3);
+        assert_eq!(requests_for_worker(10, 3, 2), 3);
+    }
+
+    #[test]
+    fn zero_assigned_when_workers_exceed_requests() {
+        assert_eq!(requests_for_worker(2, 4, 0), 1);
+        assert_eq!(requests_for_worker(2, 4, 1), 1);
+        assert_eq!(requests_for_worker(2, 4, 2), 0);
+        assert_eq!(requests_for_worker(2, 4, 3), 0);
+    }
 }
