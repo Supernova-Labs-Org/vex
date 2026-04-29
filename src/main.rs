@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -98,6 +99,15 @@ enum CompletionReason {
     DurationLimitReached,
 }
 
+impl CompletionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompletionReason::AllRequestsCompleted => "all_requests_completed",
+            CompletionReason::DurationLimitReached => "duration_limit_reached",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum DispatchAttemptError {
     ReconnectFailed(String),
@@ -127,6 +137,73 @@ struct WorkerResult {
     duration_limited: bool,
     drain_started: bool,
     drain_completed: bool,
+}
+
+#[derive(Serialize)]
+struct Report {
+    target: String,
+    workers: usize,
+    concurrency: usize,
+    total_time_s: f64,
+    duration_limited: bool,
+    completion_reason: String,
+    stop_policy: String,
+    drain: DrainReport,
+    requests: RequestCounts,
+    throughput: ThroughputReport,
+    errors: ErrorReport,
+    status_codes: HashMap<u16, usize>,
+    latency_success_ms: Option<LatencyReport>,
+    latency_failure_ms: Option<LatencyReport>,
+    connections: ConnectionReport,
+}
+
+#[derive(Serialize)]
+struct DrainReport {
+    started: bool,
+    completed: bool,
+}
+
+#[derive(Serialize)]
+struct RequestCounts {
+    total: usize,
+    successful: usize,
+    failed: usize,
+    timed_out: usize,
+    deadline_aborted: usize,
+}
+
+#[derive(Serialize)]
+struct ThroughputReport {
+    rps_in_duration: f64,
+    rps_end_to_end: f64,
+}
+
+#[derive(Serialize)]
+struct ErrorReport {
+    send: usize,
+    recv: usize,
+    quic: usize,
+    stream_reset: usize,
+}
+
+#[derive(Serialize)]
+struct ConnectionReport {
+    attempts: usize,
+    failures: usize,
+    peak_stream_concurrency: usize,
+    handshake_latency_ms: Option<LatencyReport>,
+}
+
+#[derive(Serialize)]
+struct LatencyReport {
+    min: f64,
+    max: f64,
+    avg: f64,
+    p50: f64,
+    p90: f64,
+    p95: f64,
+    p99: f64,
 }
 
 fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) -> usize {
@@ -714,9 +791,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if cli.json {
-        print_json(
-            &cli,
+        let report = build_report(
+            &cli.target,
+            cli.workers,
+            cli.concurrency,
             elapsed,
+            completion_reason,
             total_requests,
             successful_requests,
             failed_requests,
@@ -725,6 +805,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rps_in_duration,
             rps_end_to_end,
             hit_duration_limit,
+            cli.stop_policy,
             drain_started,
             drain_completed,
             &total_errors,
@@ -733,9 +814,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &failure_latencies,
             conn_attempts,
             conn_failures,
-            &handshake_latencies,
+            handshake_latencies.as_slice(),
             peak_concurrency,
         );
+        let mut stdout = std::io::stdout().lock();
+        serde_json::to_writer(&mut stdout, &report)?;
+        use std::io::Write as _;
+        stdout.write_all(b"\n")?;
     } else {
         if !success_latencies.is_empty() {
             print_latency_block("Latency (successful requests, ms)", &success_latencies);
@@ -780,9 +865,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_json(
-    cli: &Cli,
+fn build_report(
+    target: &str,
+    workers: usize,
+    concurrency: usize,
     elapsed: f64,
+    completion_reason: CompletionReason,
     total_requests: usize,
     successful_requests: usize,
     failed_requests: usize,
@@ -791,6 +879,7 @@ fn print_json(
     rps_in_duration: f64,
     rps_end_to_end: f64,
     hit_duration_limit: bool,
+    stop_policy: StopPolicy,
     drain_started: bool,
     drain_completed: bool,
     errors: &ErrorStats,
@@ -801,98 +890,69 @@ fn print_json(
     conn_failures: usize,
     handshake_lats: &[f64],
     peak_concurrency: usize,
-) {
-    let lat_obj = |lats: &[f64]| -> String {
-        if lats.is_empty() {
-            return "null".into();
-        }
-        let min = lats[0];
-        let max = lats[lats.len() - 1];
-        let avg = lats.iter().sum::<f64>() / lats.len() as f64;
-        format!(
-            "{{\"min\":{min:.3},\"max\":{max:.3},\"avg\":{avg:.3},\
-             \"p50\":{p50:.3},\"p90\":{p90:.3},\"p95\":{p95:.3},\"p99\":{p99:.3}}}",
-            p50 = percentile(lats, 50.0),
-            p90 = percentile(lats, 90.0),
-            p95 = percentile(lats, 95.0),
-            p99 = percentile(lats, 99.0),
-        )
-    };
-
-    let status_entries: Vec<String> = {
-        let mut sorted: Vec<_> = status_codes.iter().collect();
-        sorted.sort_by_key(|&(k, _)| k);
-        sorted.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect()
-    };
-
-    println!(
-        concat!(
-            "{{\n",
-            "  \"target\": \"{target}\",\n",
-            "  \"workers\": {workers},\n",
-            "  \"concurrency\": {concurrency},\n",
-            "  \"total_time_s\": {elapsed:.3},\n",
-            "  \"duration_limited\": {dur_lim},\n",
-            "  \"stop_policy\": \"{stop_policy}\",\n",
-            "  \"drain\": {{\"started\": {drain_started}, \"completed\": {drain_completed}}},\n",
-            "  \"requests\": {{\n",
-            "    \"total\": {total},\n",
-            "    \"successful\": {succ},\n",
-            "    \"failed\": {fail},\n",
-            "    \"timed_out\": {timed_out},\n",
-            "    \"deadline_aborted\": {deadline_aborted}\n",
-            "  }},\n",
-            "  \"throughput\": {{\n",
-            "    \"rps_in_duration\": {rps_in:.3},\n",
-            "    \"rps_end_to_end\": {rps_e2e:.3}\n",
-            "  }},\n",
-            "  \"errors\": {{\n",
-            "    \"send\": {send_err},\n",
-            "    \"recv\": {recv_err},\n",
-            "    \"quic\": {quic_err},\n",
-            "    \"stream_reset\": {reset_err}\n",
-            "  }},\n",
-            "  \"status_codes\": {{{status}}},\n",
-            "  \"latency_success_ms\": {lat_succ},\n",
-            "  \"latency_failure_ms\": {lat_fail},\n",
-            "  \"connections\": {{\n",
-            "    \"attempts\": {conn_att},\n",
-            "    \"failures\": {conn_fail},\n",
-            "    \"peak_stream_concurrency\": {peak},\n",
-            "    \"handshake_latency_ms\": {lat_hs}\n",
-            "  }}\n",
-            "}}"
-        ),
-        target = cli.target,
-        workers = cli.workers,
-        concurrency = cli.concurrency,
-        elapsed = elapsed,
-        dur_lim = hit_duration_limit,
-        stop_policy = match cli.stop_policy {
-            StopPolicy::HardCutoff => "hard-cutoff",
-            StopPolicy::GracefulDrain => "graceful-drain",
+) -> Report {
+    Report {
+        target: target.to_string(),
+        workers,
+        concurrency,
+        total_time_s: elapsed,
+        duration_limited: hit_duration_limit,
+        completion_reason: completion_reason.as_str().to_string(),
+        stop_policy: match stop_policy {
+            StopPolicy::HardCutoff => "hard-cutoff".to_string(),
+            StopPolicy::GracefulDrain => "graceful-drain".to_string(),
         },
-        drain_started = drain_started,
-        drain_completed = drain_completed,
-        total = total_requests,
-        succ = successful_requests,
-        fail = failed_requests,
-        timed_out = timed_out_requests,
-        deadline_aborted = deadline_aborted_requests,
-        rps_in = rps_in_duration,
-        rps_e2e = rps_end_to_end,
-        send_err = errors.send_errors,
-        recv_err = errors.recv_errors,
-        quic_err = errors.quic_errors,
-        reset_err = errors.stream_reset_errors,
-        status = status_entries.join(","),
-        lat_succ = lat_obj(success_lats),
-        lat_fail = lat_obj(failure_lats),
-        conn_att = conn_attempts,
-        conn_fail = conn_failures,
-        peak = peak_concurrency,
-        lat_hs = lat_obj(handshake_lats),
-    );
+        drain: DrainReport {
+            started: drain_started,
+            completed: drain_completed,
+        },
+        requests: RequestCounts {
+            total: total_requests,
+            successful: successful_requests,
+            failed: failed_requests,
+            timed_out: timed_out_requests,
+            deadline_aborted: deadline_aborted_requests,
+        },
+        throughput: ThroughputReport {
+            rps_in_duration,
+            rps_end_to_end,
+        },
+        errors: ErrorReport {
+            send: errors.send_errors,
+            recv: errors.recv_errors,
+            quic: errors.quic_errors,
+            stream_reset: errors.stream_reset_errors,
+        },
+        status_codes: status_codes.clone(),
+        latency_success_ms: latency_report(success_lats),
+        latency_failure_ms: latency_report(failure_lats),
+        connections: ConnectionReport {
+            attempts: conn_attempts,
+            failures: conn_failures,
+            peak_stream_concurrency: peak_concurrency,
+            handshake_latency_ms: latency_report(handshake_lats),
+        },
+    }
+}
+
+fn latency_report(lats: &[f64]) -> Option<LatencyReport> {
+    if lats.is_empty() {
+        return None;
+    }
+
+    let min = lats[0];
+    let max = lats[lats.len() - 1];
+    let avg = lats.iter().sum::<f64>() / lats.len() as f64;
+
+    Some(LatencyReport {
+        min,
+        max,
+        avg,
+        p50: percentile(lats, 50.0),
+        p90: percentile(lats, 90.0),
+        p95: percentile(lats, 95.0),
+        p99: percentile(lats, 99.0),
+    })
 }
 
 #[cfg(test)]
