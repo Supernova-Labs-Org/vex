@@ -1,6 +1,6 @@
 use super::{
     constants,
-    pool::{ConnectionPoolState, ErrorStats, ResponseResult},
+    pool::{ConnectionPoolState, ErrorStats, RequestError, RequestErrorKind, ResponseResult},
 };
 use quiche::{
     self,
@@ -58,7 +58,7 @@ struct StreamState {
     errors: ErrorStats,
     start: Instant,
     verbose: bool,
-    tx: oneshot::Sender<Result<ResponseResult, String>>,
+    tx: oneshot::Sender<Result<ResponseResult, RequestError>>,
 }
 
 pub struct Http3Client {
@@ -114,9 +114,10 @@ impl Http3Client {
         // ensure_connected is called there should be no orphaned streams.
         // Drain defensively in case ensure_connected is called from other paths.
         for (_, state) in self.in_flight.drain() {
-            let _ = state
-                .tx
-                .send(Err("connection replaced before stream completed".into()));
+            let _ = state.tx.send(Err(RequestError::new(
+                RequestErrorKind::ConnectionReplaced,
+                "connection replaced before stream completed",
+            )));
         }
 
         let peer_addr = self.peer_addr;
@@ -217,7 +218,7 @@ impl Http3Client {
         authority: &str,
         path: &str,
         verbose: bool,
-    ) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>), DispatchError> {
+    ) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, RequestError>>), DispatchError> {
         let pool = &mut self.pool;
         let quic_conn = pool
             .quic_conn
@@ -259,16 +260,26 @@ impl Http3Client {
         Ok((stream_id, rx))
     }
 
-    fn drain_in_flight_with_error(&mut self, message: &str, bump: fn(&mut ErrorStats)) {
+    fn drain_in_flight_with_error(
+        &mut self,
+        kind: RequestErrorKind,
+        message: &str,
+        bump: fn(&mut ErrorStats),
+    ) {
         for (_, mut state) in self.in_flight.drain() {
             bump(&mut state.errors);
-            let _ = state.tx.send(Err(message.to_string()));
+            let request_error = RequestError::new(kind.clone(), message);
+            let _ = state.tx.send(Err(request_error));
         }
     }
 
     pub fn abandon_stream(&mut self, stream_id: u64) {
         if let Some(state) = self.in_flight.remove(&stream_id) {
-            let _ = state.tx.send(Err("request timed out".into()));
+            let _ = state.tx.send(Err(RequestError::new(
+                RequestErrorKind::TimedOut,
+                "request timed out",
+            )
+            .with_stream_id(stream_id)));
         }
 
         if let Some(quic_conn) = self.pool.quic_conn.as_mut() {
@@ -314,18 +325,26 @@ impl Http3Client {
                         {
                             self.pool.mark_failed();
                             let msg = format!("quic recv error: {:?}", e);
-                            self.drain_in_flight_with_error(&msg, |errors| {
-                                errors.quic_errors += 1;
-                            });
+                            self.drain_in_flight_with_error(
+                                RequestErrorKind::Quic,
+                                &msg,
+                                |errors| {
+                                    errors.quic_errors += 1;
+                                },
+                            );
                             return false;
                         }
                     }
                     Ok(Err(err)) => {
                         self.pool.mark_failed();
                         let msg = format!("socket recv error: {err}");
-                        self.drain_in_flight_with_error(&msg, |errors| {
-                            errors.recv_errors += 1;
-                        });
+                        self.drain_in_flight_with_error(
+                            RequestErrorKind::NetworkRecv,
+                            &msg,
+                            |errors| {
+                                errors.recv_errors += 1;
+                            },
+                        );
                         return false;
                     }
                     Err(_) => {
@@ -337,9 +356,13 @@ impl Http3Client {
                     if let Err(err) = socket.send_to(&out[..write], send_info.to).await {
                         self.pool.mark_failed();
                         let msg = format!("socket send error: {err}");
-                        self.drain_in_flight_with_error(&msg, |errors| {
-                            errors.send_errors += 1;
-                        });
+                        self.drain_in_flight_with_error(
+                            RequestErrorKind::NetworkSend,
+                            &msg,
+                            |errors| {
+                                errors.send_errors += 1;
+                            },
+                        );
                         return false;
                     }
                 }
@@ -376,7 +399,7 @@ impl Http3Client {
                                     state.status_code = Some(code);
                                 }
                                 if state.verbose {
-                                    println!("{name}: {value}");
+                                    eprintln!("{name}: {value}");
                                 }
                             }
                         }
@@ -409,7 +432,11 @@ impl Http3Client {
                     Ok((_id, quiche::h3::Event::Reset(sid))) => {
                         if let Some(mut state) = self.in_flight.remove(&sid) {
                             state.errors.stream_reset_errors += 1;
-                            let _ = state.tx.send(Err(format!("stream {sid} reset by peer")));
+                            let _ = state.tx.send(Err(RequestError::new(
+                                RequestErrorKind::StreamReset,
+                                format!("stream {sid} reset by peer"),
+                            )
+                            .with_stream_id(sid)));
                         }
                     }
                     Ok((_id, quiche::h3::Event::PriorityUpdate)) => {}
@@ -418,7 +445,7 @@ impl Http3Client {
                         eprintln!("h3 poll error: {:?}", e);
                         self.pool.mark_failed();
                         let msg = format!("h3 poll error: {:?}", e);
-                        self.drain_in_flight_with_error(&msg, |errors| {
+                        self.drain_in_flight_with_error(RequestErrorKind::H3, &msg, |errors| {
                             errors.quic_errors += 1;
                         });
                         break;
@@ -436,7 +463,11 @@ impl Http3Client {
             if let Some(state) = self.in_flight.remove(&id) {
                 let latency_ms = state.start.elapsed().as_secs_f64() * 1000.0;
                 let result = match state.status_code {
-                    None => Err("stream finished without :status header".into()),
+                    None => Err(RequestError::new(
+                        RequestErrorKind::MissingStatus,
+                        "stream finished without :status header",
+                    )
+                    .with_stream_id(id)),
                     Some(code) => Ok(ResponseResult {
                         status_code: code,
                         bytes_received: state.bytes_received,
@@ -454,9 +485,10 @@ impl Http3Client {
             // closed will never complete on this connection. Signal them so their
             // tasks unblock; callers should retry these streams.
             for (_, state) in self.in_flight.drain() {
-                let _ = state
-                    .tx
-                    .send(Err("connection replaced before stream completed".into()));
+                let _ = state.tx.send(Err(RequestError::new(
+                    RequestErrorKind::ConnectionReplaced,
+                    "connection replaced before stream completed",
+                )));
             }
             return false;
         }
