@@ -98,6 +98,51 @@ Disable TLS certificate verification.
 vex --target localhost --port 8443 --insecure
 ```
 
+### `--request-timeout-ms <MILLISECONDS>`
+
+Per-request completion timeout.
+
+- Default: 5000
+- Applies to each in-flight request
+- Timed-out requests are counted as failed and timed out
+
+```bash
+vex --target example.com --request-timeout-ms 2000
+```
+
+### `--connect-timeout-ms <MILLISECONDS>`
+
+Handshake/connect timeout for connection establishment and reconnects.
+
+- Default: 5000
+- Affects initial connect and reconnect attempts
+
+```bash
+vex --target example.com --connect-timeout-ms 3000
+```
+
+### `--stop-policy <hard-cutoff|graceful-drain>`
+
+Behavior after `--duration` is reached.
+
+- `hard-cutoff` (default): immediately abort in-flight requests
+- `graceful-drain`: stop new dispatches, allow in-flight requests to finish during drain grace window
+
+```bash
+vex --target example.com --duration 30 --stop-policy graceful-drain
+```
+
+### `--drain-grace-ms <MILLISECONDS>`
+
+Additional drain window used by `--stop-policy graceful-drain`.
+
+- Default: 1000
+- Ignored when `--stop-policy hard-cutoff`
+
+```bash
+vex --target example.com --duration 30 --stop-policy graceful-drain --drain-grace-ms 5000
+```
+
 ## Output Configuration
 
 ### `--success-status <PATTERN>`
@@ -133,6 +178,18 @@ Enable verbose output.
 
 ```bash
 vex --target example.com --verbose
+```
+
+### `--json`
+
+Emit machine-readable JSON to stdout.
+
+- Default: Disabled
+- stdout contains JSON only
+- Human-readable logs remain disabled on stdout in this mode
+
+```bash
+vex --target example.com --json
 ```
 
 ## Full Example

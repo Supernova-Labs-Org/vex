@@ -1,4 +1,5 @@
 use quiche::h3;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -20,6 +21,56 @@ pub struct ResponseResult {
     pub errors: ErrorStats,
     pub latency_ms: f64,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestErrorKind {
+    ConnectionReplaced,
+    ChannelClosed,
+    TimedOut,
+    DeadlineAborted,
+    StreamReset,
+    MissingStatus,
+    ConnectionLost,
+    NetworkSend,
+    NetworkRecv,
+    Quic,
+    H3,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestError {
+    pub kind: RequestErrorKind,
+    pub message: String,
+    pub stream_id: Option<u64>,
+}
+
+impl RequestError {
+    pub fn new(kind: RequestErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            stream_id: None,
+        }
+    }
+
+    pub fn with_stream_id(mut self, stream_id: u64) -> Self {
+        self.stream_id = Some(stream_id);
+        self
+    }
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(stream_id) = self.stream_id {
+            write!(f, "{} (stream {})", self.message, stream_id)
+        } else {
+            write!(f, "{}", self.message)
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
 
 /// Persistent connection pool state per worker
 ///

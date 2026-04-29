@@ -1,5 +1,6 @@
-use clap::Parser;
-use std::collections::HashMap;
+use clap::{Parser, ValueEnum};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -7,7 +8,7 @@ use tokio::sync::oneshot;
 pub mod client;
 pub mod utils;
 
-use client::{ErrorStats, ResponseResult};
+use client::{ErrorStats, RequestError, RequestErrorKind, ResponseResult};
 use utils::{
     is_success_status, parse_target, percentile, resolve_target, sni_server_name,
     validate_success_pattern,
@@ -15,6 +16,12 @@ use utils::{
 
 const MAX_DISPATCH_ATTEMPTS: usize = 5;
 const DISPATCH_RETRY_BACKOFF_MS: u64 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StopPolicy {
+    HardCutoff,
+    GracefulDrain,
+}
 
 #[derive(Parser)]
 #[command(version, about = "HTTP/3 load testing tool")]
@@ -72,6 +79,16 @@ struct Cli {
     )]
     connect_timeout_ms: u64,
 
+    #[arg(long, value_enum, default_value = "hard-cutoff")]
+    stop_policy: StopPolicy,
+
+    #[arg(
+        long,
+        default_value = "1000",
+        help = "Additional drain window (ms) after duration when using graceful-drain"
+    )]
+    drain_grace_ms: u64,
+
     #[arg(long, default_value = "false", help = "Emit results as JSON to stdout")]
     json: bool,
 }
@@ -82,9 +99,132 @@ enum CompletionReason {
     DurationLimitReached,
 }
 
-enum PendingOutcome {
-    Completed(Result<ResponseResult, String>),
-    TimedOut,
+impl CompletionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompletionReason::AllRequestsCompleted => "all_requests_completed",
+            CompletionReason::DurationLimitReached => "duration_limit_reached",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DispatchAttemptError {
+    ReconnectFailed(String),
+    DispatchFailed(client::h3_client::DispatchError),
+}
+
+struct DispatchSuccess {
+    stream_id: u64,
+    rx: oneshot::Receiver<Result<ResponseResult, RequestError>>,
+    reconnect_handshake_ms: Option<f64>,
+}
+
+struct WorkerResult {
+    success: usize,
+    fail: usize,
+    timed_out: usize,
+    deadline_aborted: usize,
+    errors: ErrorStats,
+    status_codes: HashMap<u16, usize>,
+    success_latencies: Vec<f64>,
+    failure_latencies: Vec<f64>,
+    conn_attempts: usize,
+    conn_failures: usize,
+    handshake_latencies: Vec<f64>,
+    peak_concurrency: usize,
+    duration_limited: bool,
+    drain_started: bool,
+    drain_completed: bool,
+}
+
+impl Default for WorkerResult {
+    fn default() -> Self {
+        Self {
+            success: 0,
+            fail: 0,
+            timed_out: 0,
+            deadline_aborted: 0,
+            errors: ErrorStats::default(),
+            status_codes: HashMap::new(),
+            success_latencies: Vec::new(),
+            failure_latencies: Vec::new(),
+            conn_attempts: 0,
+            conn_failures: 0,
+            handshake_latencies: Vec::new(),
+            peak_concurrency: 0,
+            duration_limited: false,
+            drain_started: false,
+            drain_completed: true,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Report {
+    target: String,
+    workers: usize,
+    concurrency: usize,
+    total_time_s: f64,
+    duration_limited: bool,
+    completion_reason: String,
+    stop_policy: String,
+    drain: DrainReport,
+    requests: RequestCounts,
+    throughput: ThroughputReport,
+    errors: ErrorReport,
+    status_codes: HashMap<u16, usize>,
+    latency_success_ms: Option<LatencyReport>,
+    latency_failure_ms: Option<LatencyReport>,
+    connections: ConnectionReport,
+}
+
+#[derive(Serialize)]
+struct DrainReport {
+    started: bool,
+    completed: bool,
+}
+
+#[derive(Serialize)]
+struct RequestCounts {
+    total: usize,
+    successful: usize,
+    failed: usize,
+    timed_out: usize,
+    deadline_aborted: usize,
+}
+
+#[derive(Serialize)]
+struct ThroughputReport {
+    rps_in_duration: f64,
+    rps_end_to_end: f64,
+}
+
+#[derive(Serialize)]
+struct ErrorReport {
+    send: usize,
+    recv: usize,
+    quic: usize,
+    stream_reset: usize,
+}
+
+#[derive(Serialize)]
+struct ConnectionReport {
+    attempts: usize,
+    failures: usize,
+    peak_stream_concurrency: usize,
+    handshake_latency_ms: Option<LatencyReport>,
+}
+
+#[derive(Serialize)]
+struct LatencyReport {
+    min: f64,
+    max: f64,
+    avg: f64,
+    p50: f64,
+    p90: f64,
+    p95: f64,
+    p99: f64,
 }
 
 fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) -> usize {
@@ -94,19 +234,29 @@ fn requests_for_worker(total_requests: usize, workers: usize, worker_id: usize) 
 }
 
 fn spawn_stream_waiter(
-    join_set: &mut tokio::task::JoinSet<(u64, PendingOutcome)>,
+    join_set: &mut tokio::task::JoinSet<(u64, Result<ResponseResult, RequestError>)>,
     stream_id: u64,
-    rx: oneshot::Receiver<Result<ResponseResult, String>>,
+    rx: oneshot::Receiver<Result<ResponseResult, RequestError>>,
     request_timeout: Duration,
 ) {
     join_set.spawn(async move {
         match tokio::time::timeout(request_timeout, rx).await {
-            Ok(Ok(result)) => (stream_id, PendingOutcome::Completed(result)),
+            Ok(Ok(result)) => (stream_id, result),
             Ok(Err(_)) => (
                 stream_id,
-                PendingOutcome::Completed(Err("channel closed".into())),
+                Err(RequestError::new(
+                    RequestErrorKind::ChannelClosed,
+                    "response channel closed unexpectedly",
+                )
+                .with_stream_id(stream_id)),
             ),
-            Err(_) => (stream_id, PendingOutcome::TimedOut),
+            Err(_) => (
+                stream_id,
+                Err(
+                    RequestError::new(RequestErrorKind::TimedOut, "request timed out")
+                        .with_stream_id(stream_id),
+                ),
+            ),
         }
     });
 }
@@ -120,32 +270,36 @@ async fn dispatch_with_retry(
     path: &str,
     verbose: bool,
     connect_timeout: Duration,
-) -> Result<(u64, oneshot::Receiver<Result<ResponseResult, String>>, Option<f64>), String> {
+) -> Result<DispatchSuccess, DispatchAttemptError> {
     let mut reconnect_hs_ms: Option<f64> = None;
+
     for attempt in 1..=MAX_DISPATCH_ATTEMPTS {
         if !h3.is_connected() {
             match h3.ensure_connected(server_name, connect_timeout).await {
                 Ok(hs) => reconnect_hs_ms = hs,
-                Err(e) => return Err(format!("reconnect failed: {e}")),
+                Err(e) => return Err(DispatchAttemptError::ReconnectFailed(e.to_string())),
             }
         }
 
         match h3.dispatch(authority, path, verbose) {
-            Ok((sid, rx)) => return Ok((sid, rx, reconnect_hs_ms)),
+            Ok((stream_id, rx)) => {
+                return Ok(DispatchSuccess {
+                    stream_id,
+                    rx,
+                    reconnect_handshake_ms: reconnect_hs_ms,
+                });
+            }
             Err(err) if err.is_retryable() && attempt < MAX_DISPATCH_ATTEMPTS => {
                 let _ = h3.poll_once().await;
                 tokio::time::sleep(Duration::from_millis(DISPATCH_RETRY_BACKOFF_MS)).await;
             }
-            Err(err) => {
-                return Err(format!(
-                    "dispatch failed after {} attempts: {}",
-                    attempt, err
-                ));
-            }
+            Err(err) => return Err(DispatchAttemptError::DispatchFailed(err)),
         }
     }
 
-    Err("dispatch failed unexpectedly".into())
+    Err(DispatchAttemptError::ReconnectFailed(
+        "dispatch retries exhausted".to_string(),
+    ))
 }
 
 fn print_latency_block(label: &str, sorted: &[f64]) {
@@ -160,6 +314,20 @@ fn print_latency_block(label: &str, sorted: &[f64]) {
     println!("  p90:  {:.2}", percentile(sorted, 90.0));
     println!("  p95:  {:.2}", percentile(sorted, 95.0));
     println!("  p99:  {:.2}", percentile(sorted, 99.0));
+}
+
+fn throughput_values(total_requests: usize, duration_window: f64, elapsed: f64) -> (f64, f64) {
+    let rps_in_duration = if duration_window > 0.0 {
+        total_requests as f64 / duration_window
+    } else {
+        0.0
+    };
+    let rps_end_to_end = if elapsed > 0.0 {
+        total_requests as f64 / elapsed
+    } else {
+        0.0
+    };
+    (rps_in_duration, rps_end_to_end)
 }
 
 #[tokio::main]
@@ -186,9 +354,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    // Parse target into host and effective port.
-    // host_for_authority is used for the HTTP/3 :authority header.
-    // server_name is used for TLS SNI and must be bracket-free for IPv6.
     let (host_for_authority, effective_port) = parse_target(&cli.target, cli.port)?;
     let server_name = sni_server_name(&host_for_authority).to_string();
     let authority = if effective_port == 443 {
@@ -198,21 +363,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let peer_addr = resolve_target(&cli.target, cli.port)?;
 
-    println!("Starting HTTP/3 load test:");
-    println!("  Target: {}:{}", cli.target, effective_port);
-    println!("  Host: {}", authority);
-    println!("  Path: {}", cli.path);
-    println!("  Workers: {}", cli.workers);
-    println!("  Concurrency per worker: {}", cli.concurrency);
-    println!("  Total requests: {}", cli.requests);
-    println!("  Duration: {}s", cli.duration);
-    println!("  Request timeout: {}ms", cli.request_timeout_ms);
-    println!("  Connect timeout: {}ms", cli.connect_timeout_ms);
-    println!("  Insecure: {}", cli.insecure);
-    if cli.verbose {
-        println!("  Verbose: enabled");
+    if !cli.json {
+        println!("Starting HTTP/3 load test:");
+        println!("  Target: {}:{}", cli.target, effective_port);
+        println!("  Host: {}", authority);
+        println!("  Path: {}", cli.path);
+        println!("  Workers: {}", cli.workers);
+        println!("  Concurrency per worker: {}", cli.concurrency);
+        println!("  Total requests: {}", cli.requests);
+        println!("  Duration: {}s", cli.duration);
+        println!("  Request timeout: {}ms", cli.request_timeout_ms);
+        println!("  Connect timeout: {}ms", cli.connect_timeout_ms);
+        println!("  Stop policy: {:?}", cli.stop_policy);
+        println!("  Drain grace: {}ms", cli.drain_grace_ms);
+        println!("  Insecure: {}", cli.insecure);
+        if cli.verbose {
+            println!("  Verbose: enabled");
+        }
+        println!();
     }
-    println!();
 
     let start_time = Instant::now();
     let deadline = Arc::new(start_time + Duration::from_secs(cli.duration));
@@ -220,6 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut successful_requests = 0;
     let mut failed_requests = 0;
     let mut timed_out_requests = 0usize;
+    let mut deadline_aborted_requests = 0usize;
     let mut total_errors = ErrorStats::default();
     let mut status_code_counts: HashMap<u16, usize> = HashMap::new();
     let mut worker_failures = 0;
@@ -230,6 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handshake_latencies: Vec<f64> = Vec::new();
     let mut peak_concurrency = 0usize;
     let mut hit_duration_limit = false;
+    let mut drain_started = false;
+    let mut drain_completed = true;
 
     let mut handles = vec![];
 
@@ -244,69 +416,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let concurrency = cli.concurrency;
         let request_timeout = Duration::from_millis(cli.request_timeout_ms);
         let connect_timeout = Duration::from_millis(cli.connect_timeout_ms);
+        let stop_policy = cli.stop_policy;
+        let drain_grace = Duration::from_millis(cli.drain_grace_ms);
         let deadline = Arc::clone(&deadline);
 
         let handle = tokio::spawn(async move {
-            let mut success = 0usize;
-            let mut fail = 0usize;
-            let mut timed_out = 0usize;
-            let mut total_errors = ErrorStats::default();
-            let mut status_codes: HashMap<u16, usize> = HashMap::new();
-            let mut success_lats: Vec<f64> = Vec::new();
-            let mut failure_lats: Vec<f64> = Vec::new();
-            let mut conn_attempts = 0usize;
-            let mut conn_failures = 0usize;
-            let mut handshake_lats: Vec<f64> = Vec::new();
-            let mut peak_concurrency = 0usize;
-            let mut duration_limited = false;
-
-            macro_rules! empty_return {
-                ($fail:expr) => {
-                    return (
-                        0, $fail, 0,
-                        ErrorStats::default(), HashMap::new(),
-                        Vec::new(), Vec::new(),
-                        conn_attempts, conn_failures, handshake_lats,
-                        0usize, false,
-                    )
-                };
-            }
+            let mut result = WorkerResult::default();
 
             if requests_per_worker == 0 {
-                return (
-                    success, fail, timed_out, total_errors, status_codes,
-                    success_lats, failure_lats,
-                    conn_attempts, conn_failures, handshake_lats,
-                    peak_concurrency, duration_limited,
-                );
+                return result;
             }
 
             let mut h3 = match client::h3_client::Http3Client::new(insecure, peer_addr) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Worker {worker_id}: init failed: {e}");
-                    empty_return!(requests_per_worker);
+                    result.fail = requests_per_worker;
+                    return result;
                 }
             };
 
-            conn_attempts += 1;
+            result.conn_attempts += 1;
             match h3.ensure_connected(&server_name, connect_timeout).await {
-                Ok(Some(ms)) => handshake_lats.push(ms),
+                Ok(Some(ms)) => result.handshake_latencies.push(ms),
                 Ok(None) => {}
                 Err(e) => {
                     eprintln!("Worker {worker_id}: connect failed: {e}");
-                    conn_failures += 1;
-                    empty_return!(requests_per_worker);
+                    result.conn_failures += 1;
+                    result.fail = requests_per_worker;
+                    return result;
                 }
             }
 
             let mut dispatched = 0usize;
-            let mut pending: tokio::task::JoinSet<(u64, PendingOutcome)> =
+            let mut pending: tokio::task::JoinSet<(u64, Result<ResponseResult, RequestError>)> =
                 tokio::task::JoinSet::new();
+            let mut in_flight_streams: HashSet<u64> = HashSet::new();
             let deadline_instant = tokio::time::Instant::from_std(*deadline);
+            let mut deadline_reached = false;
+            let mut drain_deadline: Option<tokio::time::Instant> = None;
 
-            'worker: loop {
-                while pending.len() < concurrency
+            loop {
+                while !deadline_reached
+                    && pending.len() < concurrency
                     && Instant::now() < *deadline
                     && dispatched < requests_per_worker
                 {
@@ -321,98 +473,180 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await
                     {
-                        Ok((stream_id, rx, hs_ms)) => {
-                            if let Some(ms) = hs_ms {
-                                conn_attempts += 1;
-                                handshake_lats.push(ms);
+                        Ok(success) => {
+                            if let Some(ms) = success.reconnect_handshake_ms {
+                                result.conn_attempts += 1;
+                                result.handshake_latencies.push(ms);
                             }
-                            spawn_stream_waiter(&mut pending, stream_id, rx, request_timeout);
-                            let c = pending.len();
-                            if c > peak_concurrency {
-                                peak_concurrency = c;
-                            }
+
+                            in_flight_streams.insert(success.stream_id);
+                            spawn_stream_waiter(
+                                &mut pending,
+                                success.stream_id,
+                                success.rx,
+                                request_timeout,
+                            );
+                            result.peak_concurrency = result.peak_concurrency.max(pending.len());
                         }
-                        Err(e) => {
-                            eprintln!("Worker {worker_id}: {e}");
-                            if e.contains("reconnect failed") {
-                                conn_attempts += 1;
-                                conn_failures += 1;
-                            }
-                            fail += 1;
+                        Err(DispatchAttemptError::ReconnectFailed(e)) => {
+                            eprintln!("Worker {worker_id}: reconnect failed: {e}");
+                            result.conn_attempts += 1;
+                            result.conn_failures += 1;
+                            result.fail += 1;
+                        }
+                        Err(DispatchAttemptError::DispatchFailed(e)) => {
+                            eprintln!("Worker {worker_id}: dispatch failed: {e}");
+                            result.fail += 1;
                         }
                     }
                 }
 
                 if pending.is_empty() {
-                    if dispatched < requests_per_worker && Instant::now() >= *deadline {
-                        duration_limited = true;
+                    if dispatched < requests_per_worker
+                        && (deadline_reached || Instant::now() >= *deadline)
+                    {
+                        result.duration_limited = true;
                     }
                     break;
                 }
 
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline_instant) => {
-                        // Hard-cancel all in-flight stream waiters so they don't
-                        // continue running detached after the duration deadline.
-                        pending.abort_all();
-                        duration_limited = true;
-                        break 'worker;
-                    }
-                    _ = h3.poll_once(), if h3.has_in_flight() => {}
-                    Some(join_result) = pending.join_next() => {
-                        let (stream_id, outcome) = match join_result {
-                            Ok(pair) => pair,
-                            Err(e) if e.is_cancelled() => continue,
-                            Err(e) => {
-                                eprintln!("Worker {worker_id}: task panicked: {e}");
-                                fail += 1;
-                                continue;
+                if !deadline_reached {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline_instant) => {
+                            deadline_reached = true;
+                            result.duration_limited = true;
+                            result.drain_started = true;
+                            match stop_policy {
+                                StopPolicy::HardCutoff => {
+                                    let aborted = in_flight_streams.len();
+                                    for stream_id in in_flight_streams.drain() {
+                                        h3.abandon_stream(stream_id);
+                                    }
+                                    pending.abort_all();
+                                    result.deadline_aborted += aborted;
+                                    result.fail += aborted;
+                                    result.drain_completed = aborted == 0;
+                                    break;
+                                }
+                                StopPolicy::GracefulDrain => {
+                                    drain_deadline = Some(tokio::time::Instant::now() + drain_grace);
+                                }
                             }
-                        };
+                        }
+                        _ = h3.poll_once(), if h3.has_in_flight() => {}
+                        Some(join_result) = pending.join_next() => {
+                            let (stream_id, req_result) = match join_result {
+                                Ok(pair) => pair,
+                                Err(e) if e.is_cancelled() => continue,
+                                Err(e) => {
+                                    eprintln!("Worker {worker_id}: task panicked: {e}");
+                                    result.fail += 1;
+                                    continue;
+                                }
+                            };
+                            in_flight_streams.remove(&stream_id);
 
-                        match outcome {
-                            PendingOutcome::TimedOut => {
-                                h3.abandon_stream(stream_id);
-                                timed_out += 1;
-                                fail += 1;
-                                failure_lats.push(request_timeout.as_secs_f64() * 1000.0);
-                            }
-                            PendingOutcome::Completed(result) => {
-                                match result {
-                                    Ok(r) => {
-                                        *status_codes.entry(r.status_code).or_insert(0) += 1;
-                                        total_errors.send_errors += r.errors.send_errors;
-                                        total_errors.recv_errors += r.errors.recv_errors;
-                                        total_errors.quic_errors += r.errors.quic_errors;
-                                        total_errors.stream_reset_errors += r.errors.stream_reset_errors;
-                                        if is_success_status(r.status_code, &success_status) {
-                                            success += 1;
-                                            success_lats.push(r.latency_ms);
-                                        } else {
-                                            fail += 1;
-                                            failure_lats.push(r.latency_ms);
-                                        }
-                                    }
-                                    Err(ref e) if e.contains("connection replaced") => {
-                                        dispatched = dispatched.saturating_sub(1);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Worker {worker_id}: request failed: {e}");
-                                        fail += 1;
+                            match req_result {
+                                Ok(r) => {
+                                    *result.status_codes.entry(r.status_code).or_insert(0) += 1;
+                                    result.errors.send_errors += r.errors.send_errors;
+                                    result.errors.recv_errors += r.errors.recv_errors;
+                                    result.errors.quic_errors += r.errors.quic_errors;
+                                    result.errors.stream_reset_errors += r.errors.stream_reset_errors;
+                                    if is_success_status(r.status_code, &success_status) {
+                                        result.success += 1;
+                                        result.success_latencies.push(r.latency_ms);
+                                    } else {
+                                        result.fail += 1;
+                                        result.failure_latencies.push(r.latency_ms);
                                     }
                                 }
+                                Err(err) => match err.kind {
+                                    RequestErrorKind::ConnectionReplaced => {
+                                        dispatched = dispatched.saturating_sub(1);
+                                    }
+                                    RequestErrorKind::TimedOut => {
+                                        result.timed_out += 1;
+                                        result.fail += 1;
+                                        result.failure_latencies.push(request_timeout.as_secs_f64() * 1000.0);
+                                    }
+                                    _ => {
+                                        eprintln!("Worker {worker_id}: request failed: {err}");
+                                        result.fail += 1;
+                                    }
+                                },
+                            }
+                        }
+                    }
+                } else {
+                    let drain_wait_until = drain_deadline.unwrap_or_else(tokio::time::Instant::now);
+
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(drain_wait_until) => {
+                            let aborted = in_flight_streams.len();
+                            for stream_id in in_flight_streams.drain() {
+                                h3.abandon_stream(stream_id);
+                            }
+                            pending.abort_all();
+                            result.deadline_aborted += aborted;
+                            result.fail += aborted;
+                            result.drain_completed = aborted == 0;
+                            break;
+                        }
+                        _ = h3.poll_once(), if h3.has_in_flight() => {}
+                        Some(join_result) = pending.join_next() => {
+                            let (stream_id, req_result) = match join_result {
+                                Ok(pair) => pair,
+                                Err(e) if e.is_cancelled() => continue,
+                                Err(e) => {
+                                    eprintln!("Worker {worker_id}: task panicked: {e}");
+                                    result.fail += 1;
+                                    continue;
+                                }
+                            };
+                            in_flight_streams.remove(&stream_id);
+
+                            match req_result {
+                                Ok(r) => {
+                                    *result.status_codes.entry(r.status_code).or_insert(0) += 1;
+                                    result.errors.send_errors += r.errors.send_errors;
+                                    result.errors.recv_errors += r.errors.recv_errors;
+                                    result.errors.quic_errors += r.errors.quic_errors;
+                                    result.errors.stream_reset_errors += r.errors.stream_reset_errors;
+                                    if is_success_status(r.status_code, &success_status) {
+                                        result.success += 1;
+                                        result.success_latencies.push(r.latency_ms);
+                                    } else {
+                                        result.fail += 1;
+                                        result.failure_latencies.push(r.latency_ms);
+                                    }
+                                }
+                                Err(err) => match err.kind {
+                                    RequestErrorKind::ConnectionReplaced => {
+                                        dispatched = dispatched.saturating_sub(1);
+                                    }
+                                    RequestErrorKind::TimedOut => {
+                                        result.timed_out += 1;
+                                        result.fail += 1;
+                                        result.failure_latencies.push(request_timeout.as_secs_f64() * 1000.0);
+                                    }
+                                    _ => {
+                                        eprintln!("Worker {worker_id}: request failed: {err}");
+                                        result.fail += 1;
+                                    }
+                                },
+                            }
+
+                            if pending.is_empty() {
+                                result.drain_completed = true;
+                                break;
                             }
                         }
                     }
                 }
             }
 
-            (
-                success, fail, timed_out, total_errors, status_codes,
-                success_lats, failure_lats,
-                conn_attempts, conn_failures, handshake_lats,
-                peak_concurrency, duration_limited,
-            )
+            result
         });
 
         handles.push(handle);
@@ -420,29 +654,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (worker_id, handle) in handles.into_iter().enumerate() {
         match handle.await {
-            Ok((s, f, t, errors, status_codes, s_lats, f_lats, ca, cf, hs_lats, peak, duration_limited)) => {
-                total_requests += s + f;
-                successful_requests += s;
-                failed_requests += f;
-                timed_out_requests += t;
-                total_errors.send_errors += errors.send_errors;
-                total_errors.recv_errors += errors.recv_errors;
-                total_errors.quic_errors += errors.quic_errors;
-                total_errors.stream_reset_errors += errors.stream_reset_errors;
-                hit_duration_limit |= duration_limited;
-                conn_attempts += ca;
-                conn_failures += cf;
-                handshake_latencies.extend(hs_lats);
-                if peak > peak_concurrency {
-                    peak_concurrency = peak;
-                }
+            Ok(worker) => {
+                total_requests += worker.success + worker.fail;
+                successful_requests += worker.success;
+                failed_requests += worker.fail;
+                timed_out_requests += worker.timed_out;
+                deadline_aborted_requests += worker.deadline_aborted;
+                total_errors.send_errors += worker.errors.send_errors;
+                total_errors.recv_errors += worker.errors.recv_errors;
+                total_errors.quic_errors += worker.errors.quic_errors;
+                total_errors.stream_reset_errors += worker.errors.stream_reset_errors;
+                hit_duration_limit |= worker.duration_limited;
+                drain_started |= worker.drain_started;
+                drain_completed &= worker.drain_completed;
+                conn_attempts += worker.conn_attempts;
+                conn_failures += worker.conn_failures;
+                handshake_latencies.extend(worker.handshake_latencies);
+                peak_concurrency = peak_concurrency.max(worker.peak_concurrency);
 
-                for (code, count) in status_codes {
+                for (code, count) in worker.status_codes {
                     *status_code_counts.entry(code).or_insert(0) += count;
                 }
 
-                success_latencies.extend(s_lats);
-                failure_latencies.extend(f_lats);
+                success_latencies.extend(worker.success_latencies);
+                failure_latencies.extend(worker.failure_latencies);
             }
             Err(join_err) => {
                 worker_failures += 1;
@@ -470,48 +705,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let duration_window = cli.duration as f64;
 
-    println!("\nLoad test completed:");
-    println!("  Total time: {:.2}s", elapsed);
-    println!("  Total requests: {}", total_requests);
-    println!("  Successful requests: {}", successful_requests);
-    println!("  Failed requests: {}", failed_requests);
-    if timed_out_requests > 0 {
-        println!(
-            "  Timed out requests: {} (>{}ms)",
-            timed_out_requests, cli.request_timeout_ms
-        );
-    }
-    if hit_duration_limit {
-        // In-duration: requests completed ÷ configured window (excludes post-deadline tail).
-        // End-to-end: requests completed ÷ actual wall-clock time (includes post-deadline tail).
-        println!(
-            "  Req/s (in-duration):  {:.2}",
-            if duration_window > 0.0 { total_requests as f64 / duration_window } else { 0.0 }
-        );
-        println!(
-            "  Req/s (end-to-end):   {:.2}",
-            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
-        );
-    } else {
-        println!(
-            "  Requests/sec: {:.2}",
-            if elapsed > 0.0 { total_requests as f64 / elapsed } else { 0.0 }
-        );
-    }
+    if !cli.json {
+        println!("\nLoad test completed:");
+        println!("  Total time: {:.2}s", elapsed);
+        println!("  Total requests: {}", total_requests);
+        println!("  Successful requests: {}", successful_requests);
+        println!("  Failed requests: {}", failed_requests);
+        if timed_out_requests > 0 {
+            println!(
+                "  Timed out requests: {} (>{}ms)",
+                timed_out_requests, cli.request_timeout_ms
+            );
+        }
+        if deadline_aborted_requests > 0 {
+            println!("  Deadline-aborted requests: {}", deadline_aborted_requests);
+        }
+        if hit_duration_limit {
+            println!(
+                "  Req/s (in-duration):  {:.2}",
+                if duration_window > 0.0 {
+                    total_requests as f64 / duration_window
+                } else {
+                    0.0
+                }
+            );
+            println!(
+                "  Req/s (end-to-end):   {:.2}",
+                if elapsed > 0.0 {
+                    total_requests as f64 / elapsed
+                } else {
+                    0.0
+                }
+            );
+        } else {
+            println!(
+                "  Requests/sec: {:.2}",
+                if elapsed > 0.0 {
+                    total_requests as f64 / elapsed
+                } else {
+                    0.0
+                }
+            );
+        }
 
-    match completion_reason {
-        CompletionReason::DurationLimitReached => {
-            println!(
-                "  Completion reason: Duration limit ({:.0}s) reached (actual: {:.2}s)",
-                cli.duration, elapsed
-            );
+        match completion_reason {
+            CompletionReason::DurationLimitReached => {
+                println!(
+                    "  Completion reason: Duration limit ({:.0}s) reached (actual: {:.2}s)",
+                    cli.duration, elapsed
+                );
+            }
+            CompletionReason::AllRequestsCompleted => {
+                println!(
+                    "  Completion reason: All {} requests completed",
+                    cli.requests
+                );
+            }
         }
-        CompletionReason::AllRequestsCompleted => {
-            println!(
-                "  Completion reason: All {} requests completed",
-                cli.requests
-            );
-        }
+
+        println!(
+            "  Drain policy: {:?}, started: {}, completed: {}",
+            cli.stop_policy, drain_started, drain_completed
+        );
     }
 
     let has_errors = total_errors.send_errors > 0
@@ -519,7 +774,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || total_errors.quic_errors > 0
         || total_errors.stream_reset_errors > 0;
 
-    if has_errors {
+    if has_errors && !cli.json {
         println!("\nError breakdown:");
         if total_errors.send_errors > 0 {
             println!("  Network send errors: {}", total_errors.send_errors);
@@ -538,7 +793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !status_code_counts.is_empty() {
+    if !status_code_counts.is_empty() && !cli.json {
         println!("\nHTTP Status code breakdown:");
         let mut sorted_codes: Vec<_> = status_code_counts.iter().collect();
         sorted_codes.sort_by_key(|&(code, _)| code);
@@ -559,17 +814,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     failure_latencies.sort_by(|a, b| a.total_cmp(b));
     handshake_latencies.sort_by(|a, b| a.total_cmp(b));
 
-    let rps_in_duration = if duration_window > 0.0 { total_requests as f64 / duration_window } else { 0.0 };
-    let rps_end_to_end  = if elapsed > 0.0           { total_requests as f64 / elapsed }          else { 0.0 };
+    let (rps_in_duration, rps_end_to_end) =
+        throughput_values(total_requests, duration_window, elapsed);
 
     if cli.json {
-        print_json(
-            &cli, elapsed, total_requests, successful_requests, failed_requests,
-            timed_out_requests, rps_in_duration, rps_end_to_end, hit_duration_limit,
-            &total_errors, &status_code_counts,
-            &success_latencies, &failure_latencies,
-            conn_attempts, conn_failures, &handshake_latencies, peak_concurrency,
+        let report = build_report(
+            &cli.target,
+            cli.workers,
+            cli.concurrency,
+            elapsed,
+            completion_reason,
+            total_requests,
+            successful_requests,
+            failed_requests,
+            timed_out_requests,
+            deadline_aborted_requests,
+            rps_in_duration,
+            rps_end_to_end,
+            hit_duration_limit,
+            cli.stop_policy,
+            drain_started,
+            drain_completed,
+            &total_errors,
+            &status_code_counts,
+            &success_latencies,
+            &failure_latencies,
+            conn_attempts,
+            conn_failures,
+            handshake_latencies.as_slice(),
+            peak_concurrency,
         );
+        let mut stdout = std::io::stdout().lock();
+        serde_json::to_writer(&mut stdout, &report)?;
+        use std::io::Write as _;
+        stdout.write_all(b"\n")?;
     } else {
         if !success_latencies.is_empty() {
             print_latency_block("Latency (successful requests, ms)", &success_latencies);
@@ -614,16 +892,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_json(
-    cli: &Cli,
+fn build_report(
+    target: &str,
+    workers: usize,
+    concurrency: usize,
     elapsed: f64,
+    completion_reason: CompletionReason,
     total_requests: usize,
     successful_requests: usize,
     failed_requests: usize,
     timed_out_requests: usize,
+    deadline_aborted_requests: usize,
     rps_in_duration: f64,
     rps_end_to_end: f64,
     hit_duration_limit: bool,
+    stop_policy: StopPolicy,
+    drain_started: bool,
+    drain_completed: bool,
     errors: &ErrorStats,
     status_codes: &HashMap<u16, usize>,
     success_lats: &[f64],
@@ -632,93 +917,74 @@ fn print_json(
     conn_failures: usize,
     handshake_lats: &[f64],
     peak_concurrency: usize,
-) {
-    let lat_obj = |lats: &[f64]| -> String {
-        if lats.is_empty() {
-            return "null".into();
-        }
-        let min = lats[0];
-        let max = lats[lats.len() - 1];
-        let avg = lats.iter().sum::<f64>() / lats.len() as f64;
-        format!(
-            "{{\"min\":{min:.3},\"max\":{max:.3},\"avg\":{avg:.3},\
-             \"p50\":{p50:.3},\"p90\":{p90:.3},\"p95\":{p95:.3},\"p99\":{p99:.3}}}",
-            p50 = percentile(lats, 50.0),
-            p90 = percentile(lats, 90.0),
-            p95 = percentile(lats, 95.0),
-            p99 = percentile(lats, 99.0),
-        )
-    };
+) -> Report {
+    Report {
+        target: target.to_string(),
+        workers,
+        concurrency,
+        total_time_s: elapsed,
+        duration_limited: hit_duration_limit,
+        completion_reason: completion_reason.as_str().to_string(),
+        stop_policy: match stop_policy {
+            StopPolicy::HardCutoff => "hard-cutoff".to_string(),
+            StopPolicy::GracefulDrain => "graceful-drain".to_string(),
+        },
+        drain: DrainReport {
+            started: drain_started,
+            completed: drain_completed,
+        },
+        requests: RequestCounts {
+            total: total_requests,
+            successful: successful_requests,
+            failed: failed_requests,
+            timed_out: timed_out_requests,
+            deadline_aborted: deadline_aborted_requests,
+        },
+        throughput: ThroughputReport {
+            rps_in_duration,
+            rps_end_to_end,
+        },
+        errors: ErrorReport {
+            send: errors.send_errors,
+            recv: errors.recv_errors,
+            quic: errors.quic_errors,
+            stream_reset: errors.stream_reset_errors,
+        },
+        status_codes: status_codes.clone(),
+        latency_success_ms: latency_report(success_lats),
+        latency_failure_ms: latency_report(failure_lats),
+        connections: ConnectionReport {
+            attempts: conn_attempts,
+            failures: conn_failures,
+            peak_stream_concurrency: peak_concurrency,
+            handshake_latency_ms: latency_report(handshake_lats),
+        },
+    }
+}
 
-    let status_entries: Vec<String> = {
-        let mut sorted: Vec<_> = status_codes.iter().collect();
-        sorted.sort_by_key(|&(k, _)| k);
-        sorted.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect()
-    };
+fn latency_report(lats: &[f64]) -> Option<LatencyReport> {
+    if lats.is_empty() {
+        return None;
+    }
 
-    println!(
-        concat!(
-            "{{\n",
-            "  \"target\": \"{target}\",\n",
-            "  \"workers\": {workers},\n",
-            "  \"concurrency\": {concurrency},\n",
-            "  \"total_time_s\": {elapsed:.3},\n",
-            "  \"duration_limited\": {dur_lim},\n",
-            "  \"requests\": {{\n",
-            "    \"total\": {total},\n",
-            "    \"successful\": {succ},\n",
-            "    \"failed\": {fail},\n",
-            "    \"timed_out\": {timed_out}\n",
-            "  }},\n",
-            "  \"throughput\": {{\n",
-            "    \"rps_in_duration\": {rps_in:.3},\n",
-            "    \"rps_end_to_end\": {rps_e2e:.3}\n",
-            "  }},\n",
-            "  \"errors\": {{\n",
-            "    \"send\": {send_err},\n",
-            "    \"recv\": {recv_err},\n",
-            "    \"quic\": {quic_err},\n",
-            "    \"stream_reset\": {reset_err}\n",
-            "  }},\n",
-            "  \"status_codes\": {{{status}}},\n",
-            "  \"latency_success_ms\": {lat_succ},\n",
-            "  \"latency_failure_ms\": {lat_fail},\n",
-            "  \"connections\": {{\n",
-            "    \"attempts\": {conn_att},\n",
-            "    \"failures\": {conn_fail},\n",
-            "    \"peak_stream_concurrency\": {peak},\n",
-            "    \"handshake_latency_ms\": {lat_hs}\n",
-            "  }}\n",
-            "}}"
-        ),
-        target      = cli.target,
-        workers     = cli.workers,
-        concurrency = cli.concurrency,
-        elapsed     = elapsed,
-        dur_lim     = hit_duration_limit,
-        total       = total_requests,
-        succ        = successful_requests,
-        fail        = failed_requests,
-        timed_out   = timed_out_requests,
-        rps_in      = rps_in_duration,
-        rps_e2e     = rps_end_to_end,
-        send_err    = errors.send_errors,
-        recv_err    = errors.recv_errors,
-        quic_err    = errors.quic_errors,
-        reset_err   = errors.stream_reset_errors,
-        status      = status_entries.join(","),
-        lat_succ    = lat_obj(success_lats),
-        lat_fail    = lat_obj(failure_lats),
-        conn_att    = conn_attempts,
-        conn_fail   = conn_failures,
-        peak        = peak_concurrency,
-        lat_hs      = lat_obj(handshake_lats),
-    );
+    let min = lats[0];
+    let max = lats[lats.len() - 1];
+    let avg = lats.iter().sum::<f64>() / lats.len() as f64;
+
+    Some(LatencyReport {
+        min,
+        max,
+        avg,
+        p50: percentile(lats, 50.0),
+        p90: percentile(lats, 90.0),
+        p95: percentile(lats, 95.0),
+        p99: percentile(lats, 99.0),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::requests_for_worker;
+    use super::{requests_for_worker, throughput_values};
 
     #[test]
     fn distributes_requests_evenly_across_workers() {
@@ -733,5 +999,19 @@ mod tests {
         assert_eq!(requests_for_worker(2, 4, 1), 1);
         assert_eq!(requests_for_worker(2, 4, 2), 0);
         assert_eq!(requests_for_worker(2, 4, 3), 0);
+    }
+
+    #[test]
+    fn throughput_calculation_handles_normal_case() {
+        let (in_duration, end_to_end) = throughput_values(1000, 10.0, 12.5);
+        assert_eq!(in_duration, 100.0);
+        assert_eq!(end_to_end, 80.0);
+    }
+
+    #[test]
+    fn throughput_calculation_handles_zero_values() {
+        let (in_duration, end_to_end) = throughput_values(1000, 0.0, 0.0);
+        assert_eq!(in_duration, 0.0);
+        assert_eq!(end_to_end, 0.0);
     }
 }
