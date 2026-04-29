@@ -568,6 +568,35 @@ vex --target example.com:9000 --port 443  # Uses port 9000</code></pre>
 <li>Use for self-signed certificates or testing</li>
 </ul>
 <pre class="highlight"><code class="language-bash">vex --target localhost --port 8443 --insecure</code></pre>
+<h3 id="-request-timeout-ms-milliseconds"><code>--request-timeout-ms &lt;MILLISECONDS&gt;</code><a class="headerlink" href="#-request-timeout-ms-milliseconds" title="Permanent link">&para;</a></h3>
+<p>Per-request completion timeout.</p>
+<ul>
+<li>Default: 5000</li>
+<li>Applies to each in-flight request</li>
+<li>Timed-out requests are counted as failed and timed out</li>
+</ul>
+<pre class="highlight"><code class="language-bash">vex --target example.com --request-timeout-ms 2000</code></pre>
+<h3 id="-connect-timeout-ms-milliseconds"><code>--connect-timeout-ms &lt;MILLISECONDS&gt;</code><a class="headerlink" href="#-connect-timeout-ms-milliseconds" title="Permanent link">&para;</a></h3>
+<p>Handshake/connect timeout for connection establishment and reconnects.</p>
+<ul>
+<li>Default: 5000</li>
+<li>Affects initial connect and reconnect attempts</li>
+</ul>
+<pre class="highlight"><code class="language-bash">vex --target example.com --connect-timeout-ms 3000</code></pre>
+<h3 id="-stop-policy-hard-cutoffgraceful-drain"><code>--stop-policy &lt;hard-cutoff|graceful-drain&gt;</code><a class="headerlink" href="#-stop-policy-hard-cutoffgraceful-drain" title="Permanent link">&para;</a></h3>
+<p>Behavior after <code>--duration</code> is reached.</p>
+<ul>
+<li><code>hard-cutoff</code> (default): immediately abort in-flight requests</li>
+<li><code>graceful-drain</code>: stop new dispatches, allow in-flight requests to finish during drain grace window</li>
+</ul>
+<pre class="highlight"><code class="language-bash">vex --target example.com --duration 30 --stop-policy graceful-drain</code></pre>
+<h3 id="-drain-grace-ms-milliseconds"><code>--drain-grace-ms &lt;MILLISECONDS&gt;</code><a class="headerlink" href="#-drain-grace-ms-milliseconds" title="Permanent link">&para;</a></h3>
+<p>Additional drain window used by <code>--stop-policy graceful-drain</code>.</p>
+<ul>
+<li>Default: 1000</li>
+<li>Ignored when <code>--stop-policy hard-cutoff</code></li>
+</ul>
+<pre class="highlight"><code class="language-bash">vex --target example.com --duration 30 --stop-policy graceful-drain --drain-grace-ms 5000</code></pre>
 <h2 id="output-configuration">Output Configuration<a class="headerlink" href="#output-configuration" title="Permanent link">&para;</a></h2>
 <h3 id="-success-status-pattern"><code>--success-status &lt;PATTERN&gt;</code><a class="headerlink" href="#-success-status-pattern" title="Permanent link">&para;</a></h3>
 <p>Define which HTTP status codes count as successful requests.</p>
@@ -594,6 +623,14 @@ Invalid tokens (for example <code>2xy</code> or <code>700</code>) are rejected a
 <li>Useful for debugging</li>
 </ul>
 <pre class="highlight"><code class="language-bash">vex --target example.com --verbose</code></pre>
+<h3 id="-json"><code>--json</code><a class="headerlink" href="#-json" title="Permanent link">&para;</a></h3>
+<p>Emit machine-readable JSON to stdout.</p>
+<ul>
+<li>Default: Disabled</li>
+<li>stdout contains JSON only</li>
+<li>Human-readable logs remain disabled on stdout in this mode</li>
+</ul>
+<pre class="highlight"><code class="language-bash">vex --target example.com --json</code></pre>
 <h2 id="full-example">Full Example<a class="headerlink" href="#full-example" title="Permanent link">&para;</a></h2>
 <p>All options combined:</p>
 <pre class="highlight"><code class="language-bash">vex --target api.example.com \
@@ -817,6 +854,30 @@ Invalid tokens (for example <code>2xy</code> or <code>700</code>) are rejected a
             --insecure
         </a>
         
+        <a href="#-request-timeout-ms-milliseconds"
+            class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
+            data-active="false" data-depth="3">
+            --request-timeout-ms &lt;MILLISECONDS&gt;
+        </a>
+        
+        <a href="#-connect-timeout-ms-milliseconds"
+            class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
+            data-active="false" data-depth="3">
+            --connect-timeout-ms &lt;MILLISECONDS&gt;
+        </a>
+        
+        <a href="#-stop-policy-hard-cutoffgraceful-drain"
+            class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
+            data-active="false" data-depth="3">
+            --stop-policy &lt;hard-cutoff|graceful-drain&gt;
+        </a>
+        
+        <a href="#-drain-grace-ms-milliseconds"
+            class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
+            data-active="false" data-depth="3">
+            --drain-grace-ms &lt;MILLISECONDS&gt;
+        </a>
+        
         
 
         
@@ -837,6 +898,12 @@ Invalid tokens (for example <code>2xy</code> or <code>700</code>) are rejected a
             class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
             data-active="false" data-depth="3">
             --verbose
+        </a>
+        
+        <a href="#-json"
+            class="text-muted-foreground hover:text-foreground data-[active=true]:text-foreground text-[0.8rem] no-underline transition-colors data-[depth=3]:pl-4 data-[depth=4]:pl-6"
+            data-active="false" data-depth="3">
+            --json
         </a>
         
         
