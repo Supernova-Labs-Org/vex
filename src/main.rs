@@ -120,7 +120,6 @@ struct DispatchSuccess {
     reconnect_handshake_ms: Option<f64>,
 }
 
-#[derive(Default)]
 struct WorkerResult {
     success: usize,
     fail: usize,
@@ -137,6 +136,28 @@ struct WorkerResult {
     duration_limited: bool,
     drain_started: bool,
     drain_completed: bool,
+}
+
+impl Default for WorkerResult {
+    fn default() -> Self {
+        Self {
+            success: 0,
+            fail: 0,
+            timed_out: 0,
+            deadline_aborted: 0,
+            errors: ErrorStats::default(),
+            status_codes: HashMap::new(),
+            success_latencies: Vec::new(),
+            failure_latencies: Vec::new(),
+            conn_attempts: 0,
+            conn_failures: 0,
+            handshake_latencies: Vec::new(),
+            peak_concurrency: 0,
+            duration_limited: false,
+            drain_started: false,
+            drain_completed: true,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -293,6 +314,20 @@ fn print_latency_block(label: &str, sorted: &[f64]) {
     println!("  p90:  {:.2}", percentile(sorted, 90.0));
     println!("  p95:  {:.2}", percentile(sorted, 95.0));
     println!("  p99:  {:.2}", percentile(sorted, 99.0));
+}
+
+fn throughput_values(total_requests: usize, duration_window: f64, elapsed: f64) -> (f64, f64) {
+    let rps_in_duration = if duration_window > 0.0 {
+        total_requests as f64 / duration_window
+    } else {
+        0.0
+    };
+    let rps_end_to_end = if elapsed > 0.0 {
+        total_requests as f64 / elapsed
+    } else {
+        0.0
+    };
+    (rps_in_duration, rps_end_to_end)
 }
 
 #[tokio::main]
@@ -779,16 +814,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     failure_latencies.sort_by(|a, b| a.total_cmp(b));
     handshake_latencies.sort_by(|a, b| a.total_cmp(b));
 
-    let rps_in_duration = if duration_window > 0.0 {
-        total_requests as f64 / duration_window
-    } else {
-        0.0
-    };
-    let rps_end_to_end = if elapsed > 0.0 {
-        total_requests as f64 / elapsed
-    } else {
-        0.0
-    };
+    let (rps_in_duration, rps_end_to_end) =
+        throughput_values(total_requests, duration_window, elapsed);
 
     if cli.json {
         let report = build_report(
@@ -957,7 +984,7 @@ fn latency_report(lats: &[f64]) -> Option<LatencyReport> {
 
 #[cfg(test)]
 mod tests {
-    use super::requests_for_worker;
+    use super::{requests_for_worker, throughput_values};
 
     #[test]
     fn distributes_requests_evenly_across_workers() {
@@ -972,5 +999,19 @@ mod tests {
         assert_eq!(requests_for_worker(2, 4, 1), 1);
         assert_eq!(requests_for_worker(2, 4, 2), 0);
         assert_eq!(requests_for_worker(2, 4, 3), 0);
+    }
+
+    #[test]
+    fn throughput_calculation_handles_normal_case() {
+        let (in_duration, end_to_end) = throughput_values(1000, 10.0, 12.5);
+        assert_eq!(in_duration, 100.0);
+        assert_eq!(end_to_end, 80.0);
+    }
+
+    #[test]
+    fn throughput_calculation_handles_zero_values() {
+        let (in_duration, end_to_end) = throughput_values(1000, 0.0, 0.0);
+        assert_eq!(in_duration, 0.0);
+        assert_eq!(end_to_end, 0.0);
     }
 }
